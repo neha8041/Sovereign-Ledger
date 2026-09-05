@@ -1,0 +1,12 @@
+{
+  "projectId": "sovereign-ledger-507009",
+  "appId": "1:404256580882:web:8a7661aaa2efbbdf6d3fcb",
+  "apiKey": "AIzaSyAdcklsg5DRn6DwZ_NQuQ9-nqC7biSRVeQ",
+  "authDomain": "sovereign-ledger-507009.firebaseapp.com",
+  "databaseURL": "https://sovereign-ledger-507009.firebaseio.com",
+  "firestoreDatabaseId": "ai-studio-38ced5ef-68f6-4afd-a785-4b73e8ae853c",
+  "storageBucket": "sovereign-ledger-507009.firebasestorage.app",
+  "messagingSenderId": "404256580882",
+  "measurementId": "",
+  "recaptchaSiteKey": ""
+}

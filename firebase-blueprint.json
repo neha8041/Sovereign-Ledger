@@ -1,0 +1,49 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Authenticated user profile metadata",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "email": { "type": "string" },
+        "displayName": { "type": "string" },
+        "photoURL": { "type": "string" }
+      },
+      "required": ["uid"]
+    },
+    "AuditVaultEntry": {
+      "title": "AuditVaultEntry",
+      "description": "Forensic audit and executive reflection ledger entry isolated to the user",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "title": { "type": "string" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" },
+        "status": { "type": "string" },
+        "category": { "type": "string" },
+        "summary": { "type": "string" },
+        "keyTakeaways": { "type": "array" },
+        "actionItems": { "type": "array" },
+        "financialReconciliations": { "type": "array" },
+        "messages": { "type": "array" },
+        "tags": { "type": "array" },
+        "fraudRiskScore": { "type": "string" },
+        "statedTotalSum": { "type": "number" },
+        "calculatedTotalSum": { "type": "number" },
+        "fileHash": { "type": "string" },
+        "invoiceNumber": { "type": "string" },
+        "encryptedPayload": { "type": "string" }
+      },
+      "required": ["id", "userId", "createdAt", "status"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/audits/{auditId}": {
+      "schema": "AuditVaultEntry",
+      "description": "User-isolated financial audit records and session dossiers"
+    }
+  }
+}

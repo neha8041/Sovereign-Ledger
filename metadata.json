@@ -1,0 +1,6 @@
+{
+  "name": "Sovereign Ledger",
+  "description": "Personal Gemini Journal & Audit Vault with enterprise forensic financial auditing and user reflection isolation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
