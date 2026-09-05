@@ -1,4 +1,4 @@
-# Sovereign Ledger — Personal Gemini Journal & Forensic Audit Vault
+# Sovereign Ledger — Intelligent Pre-Transaction Forensic Audit Vault & Executive Financial Journal
 
 **Sovereign Ledger** is an enterprise-grade, zero-trust pre-transaction financial audit vault and executive reflection journal. It pairs Google's Gemini multimodal models with deterministic backend tool execution (`reconcile_invoice_math`), cryptographic replay shielding, client-side zero-egress document rendering, and strict owner-bound data isolation in Google Cloud Firestore.
 
