@@ -14,6 +14,7 @@ import {
   FileText
 } from 'lucide-react';
 import type { ReconcileInvoiceResult, LineItem } from '../types';
+import { safeToFixed } from '../lib/sanitizer';
 
 interface QuickReconcileModalProps {
   isOpen: boolean;
@@ -61,9 +62,9 @@ export const QuickReconcileModal: React.FC<QuickReconcileModalProps> = ({
     updated[index] = { ...updated[index], [field]: value };
     // Auto calculate row total if qty or unitPrice changed
     if (field === 'qty' || field === 'unitPrice') {
-      const q = field === 'qty' ? Number(value) : updated[index].qty;
-      const p = field === 'unitPrice' ? Number(value) : updated[index].unitPrice;
-      updated[index].rowTotal = Number((q * p).toFixed(2));
+      const q = Number(field === 'qty' ? value : updated[index].qty) || 0;
+      const p = Number(field === 'unitPrice' ? value : updated[index].unitPrice) || 0;
+      updated[index].rowTotal = Number(safeToFixed(q * p, 2));
     }
     setLineItems(updated);
   };
@@ -366,20 +367,20 @@ export const QuickReconcileModal: React.FC<QuickReconcileModalProps> = ({
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px] text-zinc-200">
                 <div className="p-2 rounded bg-zinc-950/70 border border-zinc-800/80">
                   <span className="text-zinc-500 block text-[10px]">Subtotal</span>
-                  <span>${result.subtotal.toFixed(2)}</span>
+                  <span>${safeToFixed(result.subtotal)}</span>
                 </div>
                 <div className="p-2 rounded bg-zinc-950/70 border border-zinc-800/80">
-                  <span className="text-zinc-500 block text-[10px]">Tax ({result.taxRate}%)</span>
-                  <span>${result.calculatedTax.toFixed(2)}</span>
+                  <span className="text-zinc-500 block text-[10px]">Tax ({result.taxRate ?? 0}%)</span>
+                  <span>${safeToFixed(result.calculatedTax)}</span>
                 </div>
                 <div className="p-2 rounded bg-zinc-950/70 border border-zinc-800/80">
                   <span className="text-zinc-500 block text-[10px]">Forensic Total</span>
-                  <span className="text-emerald-400 font-bold">${result.calculatedTotal.toFixed(2)}</span>
+                  <span className="text-emerald-400 font-bold">${safeToFixed(result.calculatedTotal)}</span>
                 </div>
                 <div className="p-2 rounded bg-zinc-950/70 border border-zinc-800/80">
                   <span className="text-zinc-500 block text-[10px]">Variance</span>
-                  <span className={`font-bold ${result.discrepancy > 0.01 ? 'text-red-400' : 'text-emerald-400'}`}>
-                    ${result.discrepancy.toFixed(2)}
+                  <span className={`font-bold ${(result.discrepancy ?? 0) > 0.01 ? 'text-red-400' : 'text-emerald-400'}`}>
+                    ${safeToFixed(result.discrepancy)}
                   </span>
                 </div>
               </div>
@@ -392,7 +393,7 @@ export const QuickReconcileModal: React.FC<QuickReconcileModalProps> = ({
                 <button
                   type="button"
                   onClick={() => {
-                    const prompt = `Perform forensic multi-layer audit on invoice: Vendor "${result.vendorName || vendorName}", Tax ID "${result.taxId || taxId}", PO "${result.poNumber || poNumber}". Subtotal $${result.subtotal.toFixed(2)}, Tax Rate ${result.taxRate}%, Stated Total $${result.statedTotal.toFixed(2)}.`;
+                    const prompt = `Perform forensic multi-layer audit on invoice: Vendor "${result.vendorName || vendorName}", Tax ID "${result.taxId || taxId}", PO "${result.poNumber || poNumber}". Subtotal $${safeToFixed(result.subtotal)}, Tax Rate ${result.taxRate ?? 0}%, Stated Total $${safeToFixed(result.statedTotal)}.`;
                     onInsertToChat(prompt);
                     onClose();
                   }}

@@ -4,10 +4,12 @@ import fs from 'fs';
 import crypto from 'crypto';
 import zlib from 'zlib';
 import dotenv from 'dotenv';
+import sharp from 'sharp';
 import admin from 'firebase-admin';
 import { initializeApp as initAdminApp, getApps as getAdminApps, getApp as getAdminApp } from 'firebase-admin/app';
 import { getFirestore as getAdminFirestore, type Firestore as AdminFirestore } from 'firebase-admin/firestore';
 import { GoogleGenAI, Type, FunctionDeclaration } from '@google/genai';
+import { PDFParse } from 'pdf-parse';
 import { createServer as createViteServer } from 'vite';
 
 dotenv.config();
@@ -60,6 +62,30 @@ export function encryptData(payload: object | string): string {
 }
 
 /**
+ * Decrypts an AES-256-GCM encrypted string formatted as iv:authTag:ciphertext to a raw utf8 string.
+ */
+export function decryptRawString(encryptedString: string): string | null {
+  if (!encryptedString || typeof encryptedString !== 'string') return null;
+  const parts = encryptedString.split(':');
+  if (parts.length !== 3) return null;
+  const [ivHex, authTagHex, cipherHex] = parts;
+  if (!/^[0-9a-fA-F]{24}$/.test(ivHex) || !/^[0-9a-fA-F]{32}$/.test(authTagHex) || !cipherHex) return null;
+  try {
+    const key = getEncryptionKey();
+    const iv = Buffer.from(ivHex, 'hex');
+    const authTag = Buffer.from(authTagHex, 'hex');
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+    decipher.setAuthTag(authTag);
+    let decrypted = decipher.update(cipherHex, 'hex', 'utf8');
+    decrypted += decipher.final('utf8');
+    return decrypted;
+  } catch (err: any) {
+    console.warn('[Encryption Engine] Decryption warning for payload:', err?.message || err);
+    return null;
+  }
+}
+
+/**
  * Decrypts an AES-256-GCM encrypted string formatted as iv:authTag:ciphertext.
  * Returns the parsed JSON payload object.
  */
@@ -75,20 +101,405 @@ export function decryptData(encryptedString: string): Record<string, any> {
       return {};
     }
   }
-  const [ivHex, authTagHex, cipherHex] = parts;
+  const decrypted = decryptRawString(encryptedString);
+  if (!decrypted) return {};
   try {
-    const key = getEncryptionKey();
-    const iv = Buffer.from(ivHex, 'hex');
-    const authTag = Buffer.from(authTagHex, 'hex');
-    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
-    decipher.setAuthTag(authTag);
-    let decrypted = decipher.update(cipherHex, 'hex', 'utf8');
-    decrypted += decipher.final('utf8');
     return JSON.parse(decrypted);
-  } catch (err: any) {
-    console.error('[Encryption Engine] Decryption failed for payload:', err?.message || err);
-    return {};
+  } catch {
+    return { data: decrypted };
   }
+}
+
+/**
+ * Detect MIME type directly from magic bytes in file buffer.
+ * Supports PDF, PNG, JPEG, WEBP, and TIFF magic byte sequences.
+ */
+export function detectMimeFromBuffer(buf: Buffer, fallback: string = 'image/png'): string {
+  if (!buf || buf.length < 4) return fallback;
+  if (buf.subarray(0, 5).toString('latin1') === '%PDF-') return 'application/pdf';
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'image/png';
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg';
+  if (buf.subarray(0, 4).toString('latin1') === 'RIFF' && buf.subarray(8, 12).toString('latin1') === 'WEBP') return 'image/webp';
+  // TIFF: Little-endian (II*\0) or Big-endian (MM\0*)
+  if ((buf[0] === 0x49 && buf[1] === 0x49 && buf[2] === 0x2a && buf[3] === 0x00) ||
+      (buf[0] === 0x4d && buf[1] === 0x4d && buf[2] === 0x00 && buf[3] === 0x2a)) {
+    return 'image/tiff';
+  }
+  if (fallback && (fallback.startsWith('image/') || fallback === 'application/pdf')) {
+    return fallback;
+  }
+  return fallback;
+}
+
+/**
+ * OCR First, Encrypt Second & Decrypt Buffer Fallback:
+ * Resolves incoming file attachments (raw base64, data URL, Buffer, or encrypted ciphertext).
+ * If the file is stored as encrypted AES-256-GCM ciphertext (ivHex:authTagHex:cipherHex or {iv, authTag, ciphertext}),
+ * it is decrypted back to its raw binary buffer using the system encryption key BEFORE OCR / Gemini Multimodal extraction.
+ */
+export function resolveDecryptedAttachment(att: any): {
+  data: string; // clean unencrypted base64 string
+  buffer: Buffer; // unencrypted binary buffer
+  mimeType: string;
+  name: string;
+  isDecrypted: boolean;
+} | null {
+  if (!att) return null;
+
+  try {
+    // 1. Direct Buffer support
+    if (Buffer.isBuffer(att)) {
+      const detectedMime = detectMimeFromBuffer(att, 'image/png');
+      return {
+        data: att.toString('base64'),
+        buffer: att,
+        mimeType: detectedMime,
+        name: 'invoice_document',
+        isDecrypted: false
+      };
+    }
+
+    let rawStr = '';
+    let name = (typeof att === 'object' && att.name) ? String(att.name) : 'invoice_document';
+    let mimeType = (typeof att === 'object' && (att.mimeType || att.type)) ? String(att.mimeType || att.type) : 'image/png';
+
+    // Check direct buffer property
+    if (typeof att === 'object' && att !== null && Buffer.isBuffer(att.buffer)) {
+      const detectedMime = detectMimeFromBuffer(att.buffer, mimeType);
+      return {
+        data: att.buffer.toString('base64'),
+        buffer: att.buffer,
+        mimeType: detectedMime,
+        name,
+        isDecrypted: false
+      };
+    }
+
+    if (typeof att === 'string') {
+      rawStr = att.trim();
+    } else if (typeof att === 'object' && att !== null) {
+      // Check structured object encryption { iv, authTag, ciphertext / data }
+      if (att.iv && att.authTag && (att.ciphertext || att.cipher || att.data)) {
+        const ivHex = String(att.iv).trim();
+        const authTagHex = String(att.authTag).trim();
+        const cipherHex = String(att.ciphertext || att.cipher || att.data).trim();
+        rawStr = `${ivHex}:${authTagHex}:${cipherHex}`;
+      } else if (att.encryptedPayload && typeof att.encryptedPayload === 'string') {
+        rawStr = att.encryptedPayload.trim();
+      } else if (typeof att.data === 'object' && att.data !== null && att.data.iv && att.data.authTag) {
+        const ivHex = String(att.data.iv).trim();
+        const authTagHex = String(att.data.authTag).trim();
+        const cipherHex = String(att.data.ciphertext || att.data.cipher || att.data.data).trim();
+        rawStr = `${ivHex}:${authTagHex}:${cipherHex}`;
+      } else if (att.data && typeof att.data === 'string') {
+        rawStr = att.data.trim();
+      } else if (att.base64 && typeof att.base64 === 'string') {
+        rawStr = att.base64.trim();
+      } else if (att.content && typeof att.content === 'string') {
+        rawStr = att.content.trim();
+      } else if (att.file && typeof att.file === 'string') {
+        rawStr = att.file.trim();
+      }
+    }
+
+    if (!rawStr) return null;
+
+    let isDecrypted = false;
+    // Check if rawStr is encrypted AES-256-GCM ciphertext (ivHex:authTagHex:cipherHex)
+    if (/^[0-9a-fA-F]{24}:[0-9a-fA-F]{32}:[0-9a-fA-F]+$/.test(rawStr)) {
+      const decrypted = decryptRawString(rawStr);
+      if (decrypted) {
+        isDecrypted = true;
+        try {
+          const parsed = JSON.parse(decrypted);
+          if (parsed && typeof parsed === 'object') {
+            const nested = resolveDecryptedAttachment(parsed);
+            if (nested) return { ...nested, isDecrypted: true };
+          }
+        } catch {}
+        rawStr = decrypted;
+      }
+    }
+
+    // Handle data: URL prefixes
+    if (rawStr.startsWith('data:')) {
+      const match = rawStr.match(/^data:([^;]+);base64,(.*)$/);
+      if (match) {
+        mimeType = match[1];
+        rawStr = match[2];
+      } else {
+        const commaIdx = rawStr.indexOf(',');
+        if (commaIdx !== -1) {
+          rawStr = rawStr.slice(commaIdx + 1);
+        }
+      }
+    }
+
+    const cleanBase64 = rawStr.replace(/[\r\n\s]/g, '');
+    let buffer: Buffer;
+    try {
+      buffer = Buffer.from(cleanBase64, 'base64');
+    } catch {
+      buffer = Buffer.from(cleanBase64, 'utf-8');
+    }
+
+    // Auto-detect MIME type from magic bytes in buffer
+    const detectedMime = detectMimeFromBuffer(buffer, mimeType);
+
+    return {
+      data: cleanBase64,
+      buffer,
+      mimeType: detectedMime,
+      name,
+      isDecrypted
+    };
+  } catch (err) {
+    console.error('[resolveDecryptedAttachment] Failed to resolve attachment:', err);
+    return null;
+  }
+}
+
+export interface NormalizedImageResult {
+  buffer: Buffer;
+  data: string; // standard base64 data string (no header, no whitespace)
+  mimeType: string;
+  name: string;
+  isDecrypted: boolean;
+  wasConvertedFromTiff?: boolean;
+}
+
+/**
+ * Pre-Processing & Base64 Payload Normalization:
+ * - Decrypts encrypted payload if necessary back to a raw binary buffer
+ * - Converts TIFF formats (image/tiff, image/tif) into standard PNG buffers for Gemini Vision API
+ * - Normalizes EXIF orientation and cleans up low-contrast image scans
+ * - Guarantees clean base64 data string with accurate mimeType
+ */
+export async function normalizeImagePayload(att: any): Promise<NormalizedImageResult | null> {
+  const resolved = resolveDecryptedAttachment(att);
+  if (!resolved || !resolved.buffer || resolved.buffer.length === 0) {
+    return null;
+  }
+
+  let finalBuffer = resolved.buffer;
+  let finalMimeType = resolved.mimeType;
+  let wasConvertedFromTiff = false;
+
+  const isTiff = finalMimeType === 'image/tiff' ||
+    finalMimeType === 'image/tif' ||
+    finalMimeType === 'image/x-tiff' ||
+    (resolved.name && /\.(?:tiff|tif)$/i.test(resolved.name)) ||
+    ((finalBuffer.length >= 4) && (
+      (finalBuffer[0] === 0x49 && finalBuffer[1] === 0x49 && finalBuffer[2] === 0x2a && finalBuffer[3] === 0x00) ||
+      (finalBuffer[0] === 0x4d && finalBuffer[1] === 0x4d && finalBuffer[2] === 0x00 && finalBuffer[3] === 0x2a)
+    ));
+
+  if (isTiff) {
+    try {
+      finalBuffer = await sharp(finalBuffer)
+        .rotate()
+        .png()
+        .toBuffer();
+      finalMimeType = 'image/png';
+      wasConvertedFromTiff = true;
+    } catch (tiffErr: any) {
+      console.warn('[normalizeImagePayload TIFF conversion notice]:', tiffErr?.message || tiffErr);
+    }
+  } else if (finalMimeType.startsWith('image/')) {
+    try {
+      finalBuffer = await sharp(finalBuffer)
+        .rotate()
+        .toBuffer();
+    } catch (sharpErr: any) {
+      console.warn('[normalizeImagePayload auto-rotate notice]:', sharpErr?.message || sharpErr);
+    }
+  }
+
+  const cleanBase64 = finalBuffer.toString('base64');
+
+  return {
+    buffer: finalBuffer,
+    data: cleanBase64,
+    mimeType: finalMimeType,
+    name: resolved.name,
+    isDecrypted: resolved.isDecrypted,
+    wasConvertedFromTiff
+  };
+}
+
+export interface OcrExtractionResult {
+  text: string;
+  hasText: boolean;
+  hasTokens: boolean;
+  invoiceData: any | null;
+  normalizedImage: NormalizedImageResult | null;
+}
+
+/**
+ * Optical Character Recognition (OCR) Extraction Tool & Local Text Extraction:
+ * Ingests image or PDF attachment, resolves and decrypts binary buffers, extracts
+ * text tokens and parses invoice fields deterministically.
+ */
+export async function ocr_extraction(
+  attachment?: any,
+  supplementalText?: string
+): Promise<OcrExtractionResult> {
+  const normalized = attachment ? await normalizeImagePayload(attachment) : null;
+  let extractedText = supplementalText || '';
+
+  if (normalized && (normalized.mimeType === 'application/pdf' || (normalized.name && normalized.name.toLowerCase().endsWith('.pdf')))) {
+    try {
+      const pdfRes = await processPdfDocument(normalized.buffer);
+      if (pdfRes.text) {
+        extractedText += '\n' + pdfRes.text;
+      }
+    } catch (e: any) {
+      console.warn('[ocr_extraction PDF notice]:', e?.message || e);
+    }
+  }
+
+  if (normalized) {
+    try {
+      const bufText = extractTextFromBuffer(normalized.buffer, normalized.mimeType, normalized.name);
+      if (bufText && bufText.trim()) {
+        extractedText += '\n' + bufText;
+      }
+    } catch {}
+  }
+
+  const cleanText = extractedText.trim();
+  const tokenMatches = cleanText.match(/\b[A-Za-z0-9$%.,#-]{2,}\b/g) || [];
+  const hasTokens = tokenMatches.length >= 3;
+
+  let invoiceData: any = null;
+  if (hasTokens) {
+    try {
+      invoiceData = await extractLocalInvoiceData(cleanText, normalized || attachment);
+    } catch {}
+  }
+
+  return {
+    text: cleanText,
+    hasText: cleanText.length > 0,
+    hasTokens,
+    invoiceData,
+    normalizedImage: normalized
+  };
+}
+
+export const ocrExtraction = ocr_extraction;
+
+/**
+ * Structured Vision Fallback:
+ * If local OCR extraction yields no text tokens or numbers, sends the normalized
+ * unencrypted image payload to Gemini Vision with a structured JSON prompt extracting:
+ * - Vendor Name & PO/Invoice Number
+ * - Line Items (Quantity, Description, Unit Price, Total)
+ * - Subtotal, Tax Rate/Amount, and Stated Total
+ */
+export async function extractInvoiceViaGeminiVision(
+  normalizedImage: NormalizedImageResult,
+  supplementalText?: string
+): Promise<any | null> {
+  if (!process.env.GEMINI_API_KEY) {
+    return null;
+  }
+
+  const ocrPrompt = `Execute Optical Character Recognition (OCR) and forensic document inspection on this uploaded invoice/receipt image (PNG, JPEG, WebP, or document scan).
+Extract vendor name (vendorName), tax ID (taxId), invoice or PO number (poNumber), itemized line items with quantities, unit prices, and row totals, subtotal, tax rate, stated tax, and stated total.
+Handle low-contrast, skewed, or rotated text gracefully.
+
+You MUST respond with a single, raw, valid JSON object (no markdown formatting, no backticks, no code block) with EXACTLY these fields:
+{
+  "vendorName": "string",
+  "taxId": "string or null",
+  "poNumber": "string or null",
+  "invoiceNumber": "string or null",
+  "subtotal": 0.00,
+  "taxRate": 0.00,
+  "statedTax": 0.00,
+  "statedTotal": 0.00,
+  "lineItems": [
+    {
+      "description": "string",
+      "qty": 1,
+      "unitPrice": 0.00,
+      "rowTotal": 0.00
+    }
+  ],
+  "itemSummary": "string"
+}
+Ensure subtotal, statedTax, and statedTotal are numbers.
+Extract the true vendor name and invoice number accurately from the image text.`;
+
+  const messages = [
+    {
+      role: 'user',
+      content: supplementalText ? `${ocrPrompt}\n\nUser notes: ${supplementalText}` : ocrPrompt,
+      attachment: {
+        name: normalizedImage.name,
+        type: normalizedImage.mimeType,
+        data: normalizedImage.data
+      }
+    }
+  ];
+
+  try {
+    const result = await runGeminiWithFallback(messages as any, {
+      temperature: 0.1,
+      enableTools: true,
+      systemInstruction: 'You are Sovereign Ledger OCR and forensic inspection engine. Inspect image receipt and call reconcile_invoice_math or return valid JSON representing invoice fields.'
+    });
+
+    // Check if tool reconcile_invoice_math was called directly
+    const candidate = result.response.candidates?.[0];
+    const funcCall = candidate?.content?.parts?.find((p: any) => p.functionCall && p.functionCall.name === 'reconcile_invoice_math');
+    if (funcCall && funcCall.functionCall && funcCall.functionCall.args) {
+      const args = funcCall.functionCall.args;
+      const extracted = await extractLocalInvoiceData(args, {
+        name: normalizedImage.name,
+        type: normalizedImage.mimeType,
+        data: normalizedImage.data
+      });
+      if (extracted && (extracted.subtotal !== undefined || extracted.statedTotal !== undefined)) {
+        return extracted;
+      }
+    }
+
+    // Check for JSON in text output
+    const textOutput = result.response.text || '';
+    if (textOutput) {
+      const jsonMatch = textOutput.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        try {
+          const parsed = JSON.parse(jsonMatch[0]);
+          if (parsed && typeof parsed === 'object') {
+            const extracted = await extractLocalInvoiceData(parsed, {
+              name: normalizedImage.name,
+              type: normalizedImage.mimeType,
+              data: normalizedImage.data
+            });
+            if (extracted && (extracted.subtotal !== undefined || extracted.statedTotal !== undefined)) {
+              return extracted;
+            }
+          }
+        } catch {}
+      }
+
+      const extracted = await extractLocalInvoiceData(textOutput, {
+        name: normalizedImage.name,
+        type: normalizedImage.mimeType,
+        data: normalizedImage.data
+      });
+      if (extracted && (extracted.subtotal !== undefined || extracted.statedTotal !== undefined)) {
+        return extracted;
+      }
+    }
+  } catch (err: any) {
+    console.warn('[extractInvoiceViaGeminiVision Notice]:', err?.message || err);
+  }
+
+  return null;
 }
 
 // Standard fallback Firebase configuration keys
@@ -191,6 +602,7 @@ interface ProcessedAuditRecord {
   auditId?: string;
   fileHash?: string;
   invoiceNumber?: string;
+  vendorName?: string;
   timestamp: number;
 }
 const processedReplayLedger = new Map<string, ProcessedAuditRecord[]>();
@@ -199,7 +611,7 @@ const processedReplayLedger = new Map<string, ProcessedAuditRecord[]>();
 const sessionHashes = new Set<string>();
 const sessionInvoiceNumbers = new Set<string>();
 
-function recordProcessedAudit(userId: string, auditId?: string, fileHash?: string | null, invoiceNumber?: string | null) {
+function recordProcessedAudit(userId: string, auditId?: string, fileHash?: string | null, invoiceNumber?: string | null, vendorName?: string | null) {
   if (!userId) return;
   const cleanHash = fileHash ? fileHash.toLowerCase().trim() : undefined;
   const cleanInv = invoiceNumber ? invoiceNumber.toLowerCase().trim() : undefined;
@@ -216,6 +628,7 @@ function recordProcessedAudit(userId: string, auditId?: string, fileHash?: strin
     auditId: auditId || undefined,
     fileHash: cleanHash,
     invoiceNumber: cleanInv,
+    vendorName: vendorName || undefined,
     timestamp: Date.now()
   });
 }
@@ -242,29 +655,31 @@ function purgeProcessedAudit(userId: string, auditId?: string, fileHash?: string
 }
 
 // Calculate SHA-256 hash of an uploaded document buffer (from direct payload or latest user turn)
+// OCR First, Encrypt Second: Decrypts any encrypted ciphertext back to raw binary buffer before hashing
 function computeDocumentBufferHash(payload: any): { buffer: Buffer | null; fileHash: string | null } {
   let buffer: Buffer | null = null;
 
-  if (payload.fileBuffer) {
+  // Check payload.attachment or messages attachment
+  const att = payload.attachment || (Array.isArray(payload.messages) && payload.messages.length > 0 ? payload.messages[payload.messages.length - 1]?.attachment : undefined);
+  if (att) {
+    const resolved = resolveDecryptedAttachment(att);
+    if (resolved && resolved.buffer && resolved.buffer.length > 0) {
+      buffer = resolved.buffer;
+    }
+  }
+
+  if (!buffer && payload.fileBuffer) {
     buffer = Buffer.isBuffer(payload.fileBuffer)
       ? payload.fileBuffer
       : Buffer.from(String(payload.fileBuffer).replace(/^data:.*?;base64,/, ''), 'base64');
-  } else if (payload.documentBuffer) {
+  } else if (!buffer && payload.documentBuffer) {
     buffer = Buffer.isBuffer(payload.documentBuffer)
       ? payload.documentBuffer
       : Buffer.from(String(payload.documentBuffer).replace(/^data:.*?;base64,/, ''), 'base64');
-  } else if (payload.attachment && payload.attachment.data) {
-    const raw = String(payload.attachment.data).replace(/^data:.*?;base64,/, '');
-    buffer = Buffer.from(raw, 'base64');
-  } else if (payload.data && typeof payload.data === 'string' && (payload.data.length > 50 || payload.mimeType)) {
-    const raw = String(payload.data).replace(/^data:.*?;base64,/, '');
-    buffer = Buffer.from(raw, 'base64');
-  } else if (Array.isArray(payload.messages) && payload.messages.length > 0) {
-    // Check ONLY the latest user message for a new attachment
-    const latestMsg = payload.messages[payload.messages.length - 1];
-    if (latestMsg && latestMsg.attachment && latestMsg.attachment.data) {
-      const raw = String(latestMsg.attachment.data).replace(/^data:.*?;base64,/, '');
-      buffer = Buffer.from(raw, 'base64');
+  } else if (!buffer && payload.data && typeof payload.data === 'string' && (payload.data.length > 50 || payload.mimeType)) {
+    const resolved = resolveDecryptedAttachment(payload);
+    if (resolved && resolved.buffer) {
+      buffer = resolved.buffer;
     }
   }
 
@@ -290,15 +705,21 @@ function computeDocumentBufferHash(payload: any): { buffer: Buffer | null; fileH
 }
 
 // Extract Invoice Number or PO Number from payload (checking explicit fields or latest user message)
+// Strictly rejects stop words like "from", "to", "vendor", "date", "total"
 function extractInvoiceOrPoNumber(payload: any, textContent?: string): string | null {
+  const isStopWord = (s: string) => /^(from|to|by|vendor|date|total|subtotal|tax|amount|invoice|inv|po|purchase|order|number|no|corp|inc|llc|co|ltd)$/i.test(s.trim());
+
   if (payload.invoiceNumber && typeof payload.invoiceNumber === 'string') {
-    return payload.invoiceNumber.trim();
+    const v = payload.invoiceNumber.trim();
+    if (v && !isStopWord(v)) return v;
   }
   if (payload.poNumber && typeof payload.poNumber === 'string') {
-    return payload.poNumber.trim();
+    const v = payload.poNumber.trim();
+    if (v && !isStopWord(v)) return v;
   }
   if (payload.invoiceId && typeof payload.invoiceId === 'string') {
-    return payload.invoiceId.trim();
+    const v = payload.invoiceId.trim();
+    if (v && !isStopWord(v)) return v;
   }
 
   // If textContent provided or in latest message
@@ -313,16 +734,35 @@ function extractInvoiceOrPoNumber(payload: any, textContent?: string): string | 
   }
 
   if (textToScan) {
-    const poMatch = textToScan.match(/(?:po|po\s*#|purchase\s*order|invoice\s*#?)[:\s]*["']?([A-Za-z0-9-]+)["']?/i);
-    if (poMatch && poMatch[1]) {
-      return poMatch[1].trim();
+    // 1. Structured invoice patterns e.g. INV-2047-5746 or PO-9901
+    const structuredMatch = textToScan.match(/\b(INV-[A-Za-z0-9-]+|PO-[A-Za-z0-9-]+|[A-Z]{2,4}-\d{3,})\b/i);
+    if (structuredMatch && !isStopWord(structuredMatch[1])) {
+      return structuredMatch[1].trim();
+    }
+
+    // 2. Explicit key-value pairs (requiring colon, hash, or number keywords so "invoice from" does not match)
+    const explicitMatch = textToScan.match(/(?:invoice\s*#|inv\s*#|po\s*#|purchase\s*order\s*#|invoice\s*no\.?|po\s*no\.?|inv\s*no\.?|invoice\s*:|inv\s*:|po\s*:|purchase\s*order\s*:)[\s#:]*([A-Za-z0-9-_/]+)/i);
+    if (explicitMatch && explicitMatch[1] && !isStopWord(explicitMatch[1])) {
+      return explicitMatch[1].trim();
     }
   }
 
   return null;
 }
 
-// Unified Duplicate Verification: Checks in-memory session messages array, active session Sets, global Firestore records, and ledger
+export interface ReplayCheckResult {
+  isDuplicate: boolean;
+  matchedField?: string;
+  matchedValue?: string;
+  matchedRecordId?: string;
+  matchedSessionId?: string;
+  vendorName?: string;
+  invoiceNumber?: string;
+  fileHash?: string;
+}
+
+// Unified Duplicate Verification: Checks in-memory session messages, active session Sets, client audits, and server ledger
+// Returns human-readable matchedField and full metadata (matchedRecordId, vendorName, invoiceNumber)
 function checkDuplicateReplay(
   userId: string,
   currentAuditId?: string | null,
@@ -330,85 +770,177 @@ function checkDuplicateReplay(
   invoiceNumber?: string | null,
   clientExistingHashes?: string[],
   clientExistingInvoiceNumbers?: string[],
-  activeStreamMessages?: any[]
-): { isDuplicate: boolean; matchedField?: string; matchedValue?: string } {
+  activeStreamMessages?: any[],
+  clientAudits?: any[]
+): ReplayCheckResult {
   if (!userId) return { isDuplicate: false };
 
   try {
     const cleanHash = fileHash ? fileHash.toLowerCase().trim() : null;
     const cleanInv = invoiceNumber ? invoiceNumber.toLowerCase().trim() : null;
 
-    // 1. In-memory session messages array verification (activeStreamMessages)
+    // 1. Client Audits Check (Exact Vault Record Resolution)
+    if (Array.isArray(clientAudits) && clientAudits.length > 0) {
+      for (const aud of clientAudits) {
+        const audHash = aud.fileHash ? String(aud.fileHash).toLowerCase().trim() : null;
+        const audInv = (aud.invoiceNumber || aud.poNumber) ? String(aud.invoiceNumber || aud.poNumber).toLowerCase().trim() : null;
+        
+        if (cleanHash && audHash && audHash === cleanHash) {
+          return {
+            isDuplicate: true,
+            matchedField: 'Cryptographic File Hash',
+            matchedValue: cleanHash,
+            matchedRecordId: aud.id,
+            vendorName: aud.vendorName || aud.title,
+            invoiceNumber: aud.invoiceNumber || aud.poNumber,
+            fileHash: cleanHash
+          };
+        }
+        if (cleanInv && audInv && audInv === cleanInv) {
+          return {
+            isDuplicate: true,
+            matchedField: 'Invoice / PO Identifier',
+            matchedValue: cleanInv,
+            matchedRecordId: aud.id,
+            vendorName: aud.vendorName || aud.title,
+            invoiceNumber: aud.invoiceNumber || aud.poNumber,
+            fileHash: aud.fileHash
+          };
+        }
+      }
+    }
+
+    // 2. Server In-Memory Ledger Check
+    const records = processedReplayLedger.get(userId);
+    if (records && records.length > 0) {
+      for (const rec of records) {
+        if (cleanHash && rec.fileHash && rec.fileHash === cleanHash) {
+          return {
+            isDuplicate: true,
+            matchedField: 'Cryptographic File Hash',
+            matchedValue: cleanHash,
+            matchedRecordId: rec.auditId,
+            vendorName: rec.vendorName,
+            invoiceNumber: rec.invoiceNumber,
+            fileHash: cleanHash
+          };
+        }
+        if (cleanInv && rec.invoiceNumber && rec.invoiceNumber === cleanInv) {
+          return {
+            isDuplicate: true,
+            matchedField: 'Invoice / PO Identifier',
+            matchedValue: cleanInv,
+            matchedRecordId: rec.auditId,
+            vendorName: rec.vendorName,
+            invoiceNumber: rec.invoiceNumber,
+            fileHash: rec.fileHash
+          };
+        }
+      }
+    }
+
+    // 3. In-memory session messages array verification (activeStreamMessages)
     if (Array.isArray(activeStreamMessages) && activeStreamMessages.length > 0) {
       const priorMessages = activeStreamMessages.slice(0, -1);
       for (const m of priorMessages) {
-        if (cleanHash && m.attachment?.data) {
-          const raw = String(m.attachment.data).replace(/^data:.*?;base64,/, '');
-          const msgHash = crypto.createHash('sha256').update(Buffer.from(raw, 'base64')).digest('hex');
-          if (msgHash === cleanHash) {
-            return { isDuplicate: true, matchedField: 'sessionMessageAttachmentHash', matchedValue: cleanHash };
+        if (cleanHash && m.attachment) {
+          const resolved = resolveDecryptedAttachment(m.attachment);
+          if (resolved && resolved.buffer) {
+            const msgHash = crypto.createHash('sha256').update(resolved.buffer).digest('hex');
+            if (msgHash === cleanHash) {
+              return {
+                isDuplicate: true,
+                matchedField: 'Cryptographic File Hash',
+                matchedValue: cleanHash,
+                matchedRecordId: m.auditId || m.id,
+                matchedSessionId: m.sessionId,
+                fileHash: cleanHash
+              };
+            }
           }
         }
         if (cleanHash && m.fileHash && String(m.fileHash).toLowerCase().trim() === cleanHash) {
-          return { isDuplicate: true, matchedField: 'sessionMessageFileHash', matchedValue: cleanHash };
+          return {
+            isDuplicate: true,
+            matchedField: 'Cryptographic File Hash',
+            matchedValue: cleanHash,
+            matchedRecordId: m.auditId || m.id,
+            matchedSessionId: m.sessionId,
+            fileHash: cleanHash
+          };
         }
         if (cleanInv && m.invoiceNumber && String(m.invoiceNumber).toLowerCase().trim() === cleanInv) {
-          return { isDuplicate: true, matchedField: 'sessionMessageInvoiceNumber', matchedValue: cleanInv };
+          return {
+            isDuplicate: true,
+            matchedField: 'Invoice / PO Identifier',
+            matchedValue: cleanInv,
+            matchedRecordId: m.auditId || m.id,
+            matchedSessionId: m.sessionId,
+            invoiceNumber: cleanInv
+          };
         }
         if (Array.isArray(m.toolCalls)) {
           for (const tc of m.toolCalls) {
             const p = tc.params || {};
             const r = tc.result || {};
             if (cleanHash && ((p.fileHash && String(p.fileHash).toLowerCase().trim() === cleanHash) || (r.fileHash && String(r.fileHash).toLowerCase().trim() === cleanHash))) {
-              return { isDuplicate: true, matchedField: 'sessionToolCallFileHash', matchedValue: cleanHash };
+              return {
+                isDuplicate: true,
+                matchedField: 'Cryptographic File Hash',
+                matchedValue: cleanHash,
+                matchedRecordId: r.matchedRecordId || p.matchedRecordId || m.auditId || m.id,
+                vendorName: r.vendorName || p.vendorName,
+                fileHash: cleanHash
+              };
             }
             if (cleanInv && ((p.invoiceNumber && String(p.invoiceNumber).toLowerCase().trim() === cleanInv) || (r.poNumber && String(r.poNumber).toLowerCase().trim() === cleanInv) || (r.invoiceNumber && String(r.invoiceNumber).toLowerCase().trim() === cleanInv))) {
-              return { isDuplicate: true, matchedField: 'sessionToolCallInvoiceNumber', matchedValue: cleanInv };
+              return {
+                isDuplicate: true,
+                matchedField: 'Invoice / PO Identifier',
+                matchedValue: cleanInv,
+                matchedRecordId: r.matchedRecordId || p.matchedRecordId || m.auditId || m.id,
+                vendorName: r.vendorName || p.vendorName,
+                invoiceNumber: cleanInv
+              };
             }
           }
         }
         if (cleanInv && m.content && typeof m.content === 'string') {
-          const poMatch = m.content.match(/(?:po|po\s*#|purchase\s*order|invoice\s*#?)[:\s]*["']?([A-Za-z0-9-]+)["']?/i);
-          if (poMatch && poMatch[1] && poMatch[1].toLowerCase().trim() === cleanInv) {
-            return { isDuplicate: true, matchedField: 'sessionMessageContentText', matchedValue: cleanInv };
+          const extractedNumber = extractInvoiceOrPoNumber({}, m.content);
+          if (extractedNumber && extractedNumber.toLowerCase().trim() === cleanInv) {
+            return {
+              isDuplicate: true,
+              matchedField: 'Invoice / PO Identifier',
+              matchedValue: cleanInv,
+              matchedRecordId: m.auditId || m.id,
+              matchedSessionId: m.sessionId,
+              invoiceNumber: cleanInv
+            };
           }
         }
       }
     }
 
-    // 2. Immediate Active Session Set Check (sessionHashes & sessionInvoiceNumbers)
+    // 4. Immediate Active Session Set Check (sessionHashes & sessionInvoiceNumbers)
     if (cleanHash && sessionHashes.has(cleanHash)) {
-      return { isDuplicate: true, matchedField: 'activeSessionSetHash', matchedValue: cleanHash };
+      return { isDuplicate: true, matchedField: 'Cryptographic File Hash', matchedValue: cleanHash, fileHash: cleanHash };
     }
     if (cleanInv && sessionInvoiceNumbers.has(cleanInv)) {
-      return { isDuplicate: true, matchedField: 'activeSessionSetInvoiceNumber', matchedValue: cleanInv };
+      return { isDuplicate: true, matchedField: 'Invoice / PO Identifier', matchedValue: cleanInv, invoiceNumber: cleanInv };
     }
 
-    // 3. Persistent Cloud Firestore Collection Check (global user audits without session filtering)
+    // 5. Persistent Cloud Firestore Collection Check
     if (Array.isArray(clientExistingHashes) && cleanHash) {
       const found = clientExistingHashes.some(h => String(h).toLowerCase().trim() === cleanHash);
       if (found) {
-        return { isDuplicate: true, matchedField: 'fileHash', matchedValue: cleanHash };
+        return { isDuplicate: true, matchedField: 'Cryptographic File Hash', matchedValue: cleanHash, fileHash: cleanHash };
       }
     }
 
     if (Array.isArray(clientExistingInvoiceNumbers) && cleanInv) {
       const found = clientExistingInvoiceNumbers.some(inv => String(inv).toLowerCase().trim() === cleanInv);
       if (found) {
-        return { isDuplicate: true, matchedField: 'invoiceNumber', matchedValue: cleanInv };
-      }
-    }
-
-    // 4. Server In-Memory Ledger Check
-    const records = processedReplayLedger.get(userId);
-    if (records && records.length > 0) {
-      for (const rec of records) {
-        if (cleanHash && rec.fileHash && rec.fileHash === cleanHash) {
-          return { isDuplicate: true, matchedField: 'fileHash', matchedValue: cleanHash };
-        }
-        if (cleanInv && rec.invoiceNumber && rec.invoiceNumber === cleanInv) {
-          return { isDuplicate: true, matchedField: 'invoiceNumber', matchedValue: cleanInv };
-        }
+        return { isDuplicate: true, matchedField: 'Invoice / PO Identifier', matchedValue: cleanInv, invoiceNumber: cleanInv };
       }
     }
 
@@ -418,24 +950,44 @@ function checkDuplicateReplay(
     const cleanHash = fileHash ? fileHash.toLowerCase().trim() : null;
     const cleanInv = invoiceNumber ? invoiceNumber.toLowerCase().trim() : null;
     if (cleanHash && sessionHashes.has(cleanHash)) {
-      return { isDuplicate: true, matchedField: 'activeSessionSetHash', matchedValue: cleanHash };
+      return { isDuplicate: true, matchedField: 'Cryptographic File Hash', matchedValue: cleanHash, fileHash: cleanHash };
     }
     if (cleanInv && sessionInvoiceNumbers.has(cleanInv)) {
-      return { isDuplicate: true, matchedField: 'activeSessionSetInvoiceNumber', matchedValue: cleanInv };
-    }
-    const records = processedReplayLedger.get(userId);
-    if (records && records.length > 0) {
-      for (const rec of records) {
-        if (cleanHash && rec.fileHash && rec.fileHash === cleanHash) {
-          return { isDuplicate: true, matchedField: 'fileHash', matchedValue: cleanHash };
-        }
-        if (cleanInv && rec.invoiceNumber && rec.invoiceNumber === cleanInv) {
-          return { isDuplicate: true, matchedField: 'invoiceNumber', matchedValue: cleanInv };
-        }
-      }
+      return { isDuplicate: true, matchedField: 'Invoice / PO Identifier', matchedValue: cleanInv, invoiceNumber: cleanInv };
     }
     return { isDuplicate: false };
   }
+}
+
+/**
+ * Prompt Injection & Security Override Detector:
+ * Detects adversarial prompt injections attempting to ignore instructions, override security constitutions,
+ * or authorize unverified expenses.
+ */
+export function detectSecurityViolation(text: string): { isViolation: boolean; threatVector?: string } {
+  if (!text || typeof text !== 'string') return { isViolation: false };
+  const lower = text.toLowerCase();
+
+  const injectionPatterns = [
+    /ignore\s+(all\s+)?(previous|prior)\s+instructions/i,
+    /disregard\s+(all\s+)?(previous|prior)\s+instructions/i,
+    /override\s+(the\s+)?(security\s+constitution|security\s+rules|system\s+rules|system\s+instructions|guardrails)/i,
+    /bypass\s+(all\s+)?(security|guardrails|reconcile|audit)/i,
+    /authorize\s+(a\s+)?(bogus|fake|unverified|unauthorized)\s+expense/i,
+    /without\s+calling\s+reconcile_invoice_math/i,
+    /jailbreak/i,
+    /dan\s+mode/i,
+    /developer\s+mode\s+(is\s+)?enabled/i,
+    /grant\s+(me\s+)?(administrative|admin|root)\s+(privileges|access)/i
+  ];
+
+  for (const pattern of injectionPatterns) {
+    if (pattern.test(lower)) {
+      return { isViolation: true, threatVector: 'ADVERSARIAL_PROMPT_INJECTION' };
+    }
+  }
+
+  return { isViolation: false };
 }
 
 // Gemini SDK lazy initialization
@@ -643,6 +1195,14 @@ function parseMoney(val: any, fallback = 0): number {
     return isNaN(parsed) || !isFinite(parsed) ? fallback : parsed;
   }
   return fallback;
+}
+
+// Safe formatting helper to prevent "Cannot read properties of undefined (reading 'toFixed')"
+function safeToFixed(val: any, decimals = 2, fallback = '0.00'): string {
+  if (val === null || val === undefined) return fallback;
+  const num = typeof val === 'number' ? val : Number(val);
+  if (isNaN(num) || !isFinite(num)) return fallback;
+  return num.toFixed(decimals);
 }
 
 // Deterministic Multi-Layer Fraud Detection Execution
@@ -1027,8 +1587,94 @@ export function extractTextFromBuffer(buf: Buffer, mimeType?: string, fileName?:
   return [...extractedWords, ...asciiWords].join('\n');
 }
 
+// Extract embedded JPEG stream from PDF binary buffer (standard DCTDecode in scanned PDFs)
+export function extractJpegFromPdf(buf: Buffer): Buffer | null {
+  try {
+    const startIdx = buf.indexOf(Buffer.from([0xff, 0xd8, 0xff]));
+    if (startIdx === -1) return null;
+    const endIdx = buf.indexOf(Buffer.from([0xff, 0xd9]), startIdx);
+    if (endIdx === -1 || endIdx <= startIdx) return null;
+    const jpegBuf = buf.subarray(startIdx, endIdx + 2);
+    if (jpegBuf.length > 100) {
+      return jpegBuf;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export interface ProcessedPdfResult {
+  text: string;
+  renderedImageBase64?: string;
+  renderedMimeType?: string;
+  hasSelectableText: boolean;
+}
+
+// Full PDF processing pipeline: Direct vector text parsing + Stream rasterization
+export async function processPdfDocument(buf: Buffer): Promise<ProcessedPdfResult> {
+  let extractedText = '';
+  let renderedImageBase64: string | undefined;
+  let renderedMimeType: string | undefined;
+
+  // 1. Direct PDF Text Parsing: Extract selectable text vector streams
+  try {
+    const parser = new PDFParse({ data: buf });
+    const textResult = await parser.getText();
+    if (textResult && typeof textResult.text === 'string' && textResult.text.trim()) {
+      extractedText = textResult.text.trim();
+    }
+
+    // 2. Stream Rasterization: Rasterize PDF pages to image buffers (PNG base64) for Vision models
+    try {
+      const screenshot = await parser.getScreenshot();
+      if (screenshot?.pages?.[0]?.data) {
+        renderedImageBase64 = Buffer.from(screenshot.pages[0].data).toString('base64');
+        renderedMimeType = 'image/png';
+      } else if (screenshot?.pages?.[0]?.dataUrl) {
+        const dUrl = screenshot.pages[0].dataUrl;
+        const comma = dUrl.indexOf(',');
+        renderedImageBase64 = comma !== -1 ? dUrl.slice(comma + 1) : dUrl;
+        renderedMimeType = 'image/png';
+      }
+    } catch (shotErr: any) {
+      console.warn('[processPdfDocument Rasterization Notice]:', shotErr?.message || shotErr);
+    }
+
+    await parser.destroy();
+  } catch (parseErr: any) {
+    console.warn('[processPdfDocument PDFParse Notice]:', parseErr?.message || parseErr);
+  }
+
+  // 3. Fallback to embedded JPEG image stream if rasterization was not available
+  if (!renderedImageBase64) {
+    const embeddedJpeg = extractJpegFromPdf(buf);
+    if (embeddedJpeg) {
+      renderedImageBase64 = embeddedJpeg.toString('base64');
+      renderedMimeType = 'image/jpeg';
+    }
+  }
+
+  // 4. Fallback to stream decompression & character vector parsing if text was empty
+  if (!extractedText || extractedText.length < 20) {
+    const streamText = extractTextFromBuffer(buf, 'application/pdf');
+    if (streamText && streamText.trim()) {
+      extractedText = extractedText ? `${extractedText}\n${streamText}` : streamText;
+    }
+  }
+
+  const hasSelectableText = Boolean(extractedText && extractedText.length >= 10 && /[A-Za-z0-9]/.test(extractedText));
+
+  return {
+    text: extractedText,
+    renderedImageBase64,
+    renderedMimeType: renderedMimeType || 'image/png',
+    hasSelectableText
+  };
+}
+
 // Deterministic local invoice parser for offline/rate-limited/multimodal fallback
-export function extractLocalInvoiceData(rawInput: any, attachment?: { name?: string; type?: string; data?: string; mimeType?: string }) {
+export async function extractLocalInvoiceData(rawInput: any, attachment?: { name?: string; type?: string; data?: string; mimeType?: string }) {
   try {
     // 1. Direct Object Ingestion: if rawInput is already a structured JSON object
     if (rawInput && typeof rawInput === 'object') {
@@ -1122,7 +1768,7 @@ export function extractLocalInvoiceData(rawInput: any, attachment?: { name?: str
             const sub = parseMoney(parsed.subtotal, NaN);
             const tot = parseMoney(parsed.statedTotal, NaN);
             if (!isNaN(sub) || !isNaN(tot) || parsed.lineItems || parsed.vendorName) {
-              return extractLocalInvoiceData(parsed, attachment);
+              return await extractLocalInvoiceData(parsed, attachment);
             }
           }
         } catch (jsonErr) {
@@ -1132,26 +1778,37 @@ export function extractLocalInvoiceData(rawInput: any, attachment?: { name?: str
     }
 
     // 3. Multimodal File Ingestion: decompress & extract raw numbers/metadata from attached image/PDF buffer
-    const att = attachment || (rawInput && typeof rawInput === 'object' ? (rawInput.attachment || rawInput.file || rawInput.document) : undefined);
-    if (att) {
-      if (typeof att === 'object' && att.name) {
-        combinedText += `\nFilename: ${att.name}`;
-      }
-      const rawBase64 = typeof att === 'string' ? att : (att.data || att.base64 || att.content || att.file);
-      if (rawBase64 && typeof rawBase64 === 'string') {
-        try {
-          const cleanBase64 = rawBase64.includes(',') ? rawBase64.split(',')[1] : rawBase64;
-          const rawBuffer = Buffer.from(cleanBase64, 'base64');
-          if (rawBuffer && rawBuffer.length > 0) {
-            const mime = typeof att === 'object' ? (att.mimeType || att.type) : undefined;
-            const name = typeof att === 'object' ? att.name : undefined;
-            const bufferText = extractTextFromBuffer(rawBuffer, mime, name);
-            if (bufferText && bufferText.trim()) {
-              combinedText += `\n[Extracted File Buffer Text]:\n` + bufferText;
+    // OCR First, Encrypt Second: Decrypts encrypted ciphertext if necessary to guarantee raw binary buffer
+    const rawAtt = attachment || (rawInput && typeof rawInput === 'object' ? (rawInput.attachment || rawInput.file || rawInput.document) : undefined);
+    if (rawAtt) {
+      const resolved = resolveDecryptedAttachment(rawAtt);
+      if (resolved && resolved.buffer && resolved.buffer.length > 0) {
+        if (resolved.name) {
+          combinedText += `\nFilename: ${resolved.name}`;
+        }
+
+        const isPdf = resolved.mimeType === 'application/pdf' ||
+          (resolved.name && resolved.name.toLowerCase().endsWith('.pdf')) ||
+          (resolved.buffer.length >= 5 && resolved.buffer.subarray(0, 5).toString() === '%PDF-');
+
+        if (isPdf) {
+          try {
+            const pdfData = await processPdfDocument(resolved.buffer);
+            if (pdfData.text && pdfData.text.trim()) {
+              combinedText += `\n[Extracted PDF Vector Text]:\n` + pdfData.text;
             }
+          } catch (pdfErr: any) {
+            console.warn('[extractLocalInvoiceData PDF Notice]:', pdfErr?.message || pdfErr);
           }
-        } catch (bufErr) {
-          console.warn('[extractLocalInvoiceData Buffer Error]:', bufErr);
+        }
+
+        try {
+          const bufferText = extractTextFromBuffer(resolved.buffer, resolved.mimeType, resolved.name);
+          if (bufferText && bufferText.trim()) {
+            combinedText += `\n[Extracted File Buffer Text]:\n` + bufferText;
+          }
+        } catch (bufErr: any) {
+          console.warn('[extractLocalInvoiceData Buffer Error]:', bufErr?.message || bufErr);
         }
       }
     }
@@ -1295,6 +1952,44 @@ export function extractLocalInvoiceData(rawInput: any, attachment?: { name?: str
       }
     }
 
+    // Format 4: Tabular space-separated row: "Specialized Hardware    1    $29,118.83    $29,118.83"
+    const tabularRegex = /(?:^|\n)\s*([A-Za-z][A-Za-z0-9\s&.,'-]{2,45}?)\s{2,}(\d+)\s{2,}(?:@\s*)?\$?\s*([\d,]+(?:\.\d+)?)\s{2,}\$?\s*([\d,]+(?:\.\d+)?)(?:\r?\n|$)/g;
+    while ((match = tabularRegex.exec(combinedText)) !== null) {
+      const desc = match[1].trim();
+      if (!['description', 'item', 'product', 'service', 'subtotal', 'total', 'tax', 'invoice'].includes(desc.toLowerCase()) && !seenRowDescs.has(desc.toLowerCase())) {
+        const qty = parseInt(match[2], 10);
+        const unitPrice = parseMoney(match[3]);
+        const rowTotal = parseMoney(match[4]);
+        if (!isNaN(qty) && !isNaN(unitPrice) && !isNaN(rowTotal)) {
+          lineItems.push({
+            description: desc || `Item #${lineItems.length + 1}`,
+            qty,
+            unitPrice,
+            rowTotal
+          });
+          seenRowDescs.add(desc.toLowerCase());
+        }
+      }
+    }
+
+    // Format 5: Multi-line / Quantity prefix: "1  Specialized Hardware  $29,118.83  $29,118.83" or "1x Widget A @ $10.00 = $10.00"
+    const qtyPrefixRegex = /(?:^|\n)\s*(\d+)\s*[xX]?\s+([A-Za-z][A-Za-z0-9\s&.,'-]{2,45}?)\s+(?:@\s*)?\$?\s*([\d,]+(?:\.\d+)?)\s+(?:=\s*)?\$?\s*([\d,]+(?:\.\d+)?)(?:\r?\n|$)/g;
+    while ((match = qtyPrefixRegex.exec(combinedText)) !== null) {
+      const qty = parseInt(match[1], 10);
+      const desc = match[2].trim();
+      const unitPrice = parseMoney(match[3]);
+      const rowTotal = parseMoney(match[4]);
+      if (!seenRowDescs.has(desc.toLowerCase()) && !isNaN(qty) && !isNaN(unitPrice) && !isNaN(rowTotal)) {
+        lineItems.push({
+          description: desc || `Item #${lineItems.length + 1}`,
+          qty,
+          unitPrice,
+          rowTotal
+        });
+        seenRowDescs.add(desc.toLowerCase());
+      }
+    }
+
     // If subtotal is undefined, derive from sum of extracted line items if available
     if (subtotal === undefined && lineItems.length > 0) {
       subtotal = Number(lineItems.reduce((acc, item) => acc + item.rowTotal, 0).toFixed(2));
@@ -1331,8 +2026,8 @@ export function extractLocalInvoiceData(rawInput: any, attachment?: { name?: str
       statedTotal = Number((subtotal + taxAmt).toFixed(2));
     }
 
-    if (!vendorName && att && typeof att === 'object' && att.name) {
-      vendorName = att.name.replace(/\.[^/.]+$/, '').replace(/[-_]/g, ' ');
+    if (!vendorName && rawAtt && typeof rawAtt === 'object' && rawAtt.name) {
+      vendorName = rawAtt.name.replace(/\.[^/.]+$/, '').replace(/[-_]/g, ' ');
     }
 
     return {
@@ -1344,7 +2039,7 @@ export function extractLocalInvoiceData(rawInput: any, attachment?: { name?: str
       statedTax,
       statedTotal: statedTotal!,
       lineItems: lineItems.length > 0 ? lineItems : undefined,
-      itemSummary: vendorName ? `${vendorName} Financial Audit` : (att && typeof att === 'object' && att.name ? `${att.name} Audit` : 'Financial Transaction Audit')
+      itemSummary: vendorName ? `${vendorName} Financial Audit` : (rawAtt && typeof rawAtt === 'object' && rawAtt.name ? `${rawAtt.name} Audit` : 'Financial Transaction Audit')
     };
   } catch (err: any) {
     console.warn('[extractLocalInvoiceData Notice]: Gracefully handled unexpected error during extraction:', err?.message || err);
@@ -1378,75 +2073,107 @@ SYSTEM DIRECTIVES & SECURITY CONSTITUTION:
 7. Produce professional, high-density financial terminal insights.`;
 
 // Helper to format and sanitize messages into @google/genai Content parts
-function formatMessagesToGenAIContents(
+async function formatMessagesToGenAIContents(
   messages: { role: string; content?: string; text?: string; attachment?: any; parts?: any[]; toolCalls?: any[] }[]
 ) {
-  return messages.map((m) => {
-    const isModel = m.role === 'assistant' || m.role === 'model';
-    const role = isModel ? 'model' : 'user';
+  return Promise.all(
+    messages.map(async (m) => {
+      const isModel = m.role === 'assistant' || m.role === 'model';
+      const role = isModel ? 'model' : 'user';
 
-    // If explicit raw parts exist (e.g. from candidate.content or SDK message), preserve all properties directly
-    if (Array.isArray(m.parts) && m.parts.length > 0) {
-      return {
-        role,
-        parts: m.parts
-      };
-    }
+      // If explicit raw parts exist (e.g. from candidate.content or SDK message), preserve all properties directly
+      if (Array.isArray(m.parts) && m.parts.length > 0) {
+        return {
+          role,
+          parts: m.parts
+        };
+      }
 
-    const parts: any[] = [];
+      const parts: any[] = [];
 
-    // 1. Text Content
-    const textContent = m.content || m.text || '';
-    if (textContent && typeof textContent === 'string' && textContent.trim()) {
-      parts.push({ text: textContent });
-    }
+      // 1. Text Content
+      const textContent = m.content || m.text || '';
+      if (textContent && typeof textContent === 'string' && textContent.trim()) {
+        parts.push({ text: textContent });
+      }
 
-    // 2. Multimodal attachment (for user turn - PDF, PNG, JPEG, WEBP)
-    const att = m.attachment || (m as any).file || (m as any).image || (m as any).document;
-    if (!isModel && att) {
-      const rawBase64 = typeof att === 'string' ? att : (att.data || att.base64 || att.content || att.url);
-      if (rawBase64 && typeof rawBase64 === 'string') {
-        const cleanBase64 = rawBase64.includes(',') ? rawBase64.split(',')[1] : rawBase64;
-        let mimeType = (typeof att === 'object' && (att.mimeType || att.type)) ? (att.mimeType || att.type) : 'application/pdf';
-        if (mimeType === 'image/jpg') mimeType = 'image/jpeg';
+      // 2. Multimodal attachment (for user turn - PDF, PNG, JPEG, WEBP, TIFF)
+      // OCR First, Encrypt Second: Decrypts encrypted payload and normalizes images for Gemini Vision
+      const att = m.attachment || (m as any).file || (m as any).image || (m as any).document;
+      if (!isModel && att) {
+        const normalized = await normalizeImagePayload(att);
+        if (normalized && (normalized.data || normalized.buffer)) {
+          const isPdf = normalized.mimeType === 'application/pdf' ||
+            (normalized.name && normalized.name.toLowerCase().endsWith('.pdf')) ||
+            (normalized.buffer && normalized.buffer.length >= 5 && normalized.buffer.subarray(0, 5).toString() === '%PDF-');
 
-        if (!mimeType || mimeType === 'application/octet-stream') {
-          if (cleanBase64.startsWith('JVBERi')) mimeType = 'application/pdf';
-          else if (cleanBase64.startsWith('iVBORw0KGgo')) mimeType = 'image/png';
-          else if (cleanBase64.startsWith('/9j/')) mimeType = 'image/jpeg';
-          else if (cleanBase64.startsWith('UklGR')) mimeType = 'image/webp';
-          else if (att.name?.toLowerCase().endsWith('.png')) mimeType = 'image/png';
-          else if (att.name?.toLowerCase().endsWith('.jpg') || att.name?.toLowerCase().endsWith('.jpeg')) mimeType = 'image/jpeg';
-          else if (att.name?.toLowerCase().endsWith('.webp')) mimeType = 'image/webp';
-          else mimeType = 'application/pdf';
-        }
+          if (isPdf && normalized.buffer) {
+            try {
+              const pdfData = await processPdfDocument(normalized.buffer);
 
-        parts.unshift({
-          inlineData: {
-            mimeType,
-            data: cleanBase64
+              // Defensive Fallback: If document contains selectable text vector streams, extract text directly
+              if (pdfData.hasSelectableText && pdfData.text) {
+                parts.push({
+                  text: `[Extracted Document Vector Text from ${normalized.name || 'Invoice PDF'}]:\n${pdfData.text}\n\nExecute Optical Character Recognition (OCR) and forensic document inspection on this invoice text. Extract vendorName, taxId, poNumber, lineItems (with description, qty, unitPrice, rowTotal), subtotal, taxRate, statedTax, and statedTotal. Then call the reconcile_invoice_math tool with all extracted values.`
+                });
+              }
+
+              // PDF Ingestion & Stream Rasterization: pass rasterized image buffer or embedded JPEG
+              if (pdfData.renderedImageBase64) {
+                parts.unshift({
+                  inlineData: {
+                    mimeType: pdfData.renderedMimeType || 'image/png',
+                    data: pdfData.renderedImageBase64
+                  }
+                });
+              } else {
+                // Direct PDF stream fallback (supported by Gemini models that accept application/pdf)
+                parts.unshift({
+                  inlineData: {
+                    mimeType: 'application/pdf',
+                    data: normalized.data || normalized.buffer.toString('base64')
+                  }
+                });
+              }
+            } catch (pdfErr) {
+              console.warn('[formatMessagesToGenAIContents PDF error]:', pdfErr);
+              parts.unshift({
+                inlineData: {
+                  mimeType: normalized.mimeType || 'application/pdf',
+                  data: normalized.data || (normalized.buffer ? normalized.buffer.toString('base64') : '')
+                }
+              });
+            }
+          } else if (normalized.data) {
+            // Standard Image (PNG, JPEG, WEBP, TIFF auto-converted to PNG)
+            parts.unshift({
+              inlineData: {
+                mimeType: normalized.mimeType,
+                data: normalized.data
+              }
+            });
           }
-        });
 
-        // Ensure text prompt instructs Gemini Vision OCR explicitly
-        const hasOcrPrompt = textContent && /audit|ocr|invoice|reconcile/i.test(textContent);
-        if (!hasOcrPrompt) {
-          parts.push({
-            text: 'Execute Optical Character Recognition (OCR) and forensic document inspection on this uploaded invoice/receipt. Extract vendor name (vendorName), tax ID (taxId), invoice or PO number (poNumber), itemized line items with quantities, unit prices, and row totals, subtotal, tax rate, stated tax, and stated total. Then call the reconcile_invoice_math tool with all extracted values.'
-          });
+          // Ensure text prompt instructs Gemini Vision OCR explicitly
+          const hasOcrPrompt = textContent && /audit|ocr|invoice|reconcile/i.test(textContent);
+          if (!hasOcrPrompt) {
+            parts.push({
+              text: 'Execute Optical Character Recognition (OCR) and forensic document inspection on this uploaded invoice/receipt. Extract vendor name (vendorName), tax ID (taxId), invoice or PO number (poNumber), itemized line items with quantities, unit prices, and row totals, subtotal, tax rate, stated tax, and stated total. Then call the reconcile_invoice_math tool with all extracted values.'
+            });
+          }
         }
       }
-    }
 
-    if (parts.length === 0) {
-      parts.push({ text: textContent || ' ' });
-    }
+      if (parts.length === 0) {
+        parts.push({ text: textContent || ' ' });
+      }
 
-    return {
-      role,
-      parts
-    };
-  });
+      return {
+        role,
+        parts
+      };
+    })
+  );
 }
 
 // Reusable Multi-Turn Fallback Generator with Rate-Limit Backoff
@@ -1463,7 +2190,7 @@ async function runGeminiWithFallback(
   let lastError: any = null;
 
   // Format and sanitize contents for @google/genai SDK
-  const formattedContents = formatMessagesToGenAIContents(messages);
+  const formattedContents = await formatMessagesToGenAIContents(messages);
   const activeLadder = getAvailableModelLadder();
 
   for (let i = 0; i < activeLadder.length; i++) {
@@ -1616,10 +2343,24 @@ app.post(['/api/audit/verify', '/api/audit/reconcile-file'], async (req, res) =>
       // Extract from document text, OCR payload, or attached file buffer
       const textToAudit = payload.document || payload.rawInvoiceText || payload.text || '';
       const attachment = payload.attachment || payload.file || payload.image;
-      const localInvoice = extractLocalInvoiceData(textToAudit, attachment);
+      let localInvoice = await extractLocalInvoiceData(textToAudit, attachment);
 
-      if (!localInvoice) {
+      // Vision / OCR Fallback: If local parser didn't extract subtotal or total, attempt OCR and Gemini Vision
+      if ((!localInvoice || (localInvoice.subtotal === undefined && localInvoice.statedTotal === undefined)) && attachment) {
+        const ocrRes = await ocr_extraction(attachment, textToAudit);
+        if (ocrRes.invoiceData && (ocrRes.invoiceData.subtotal !== undefined || ocrRes.invoiceData.statedTotal !== undefined)) {
+          localInvoice = ocrRes.invoiceData;
+        } else if (ocrRes.normalizedImage && process.env.GEMINI_API_KEY) {
+          const visionExtracted = await extractInvoiceViaGeminiVision(ocrRes.normalizedImage, textToAudit);
+          if (visionExtracted && (visionExtracted.subtotal !== undefined || visionExtracted.statedTotal !== undefined)) {
+            localInvoice = visionExtracted;
+          }
+        }
+      }
+
+      if (!localInvoice || (localInvoice.subtotal === undefined && localInvoice.statedTotal === undefined)) {
         return res.status(422).json({
+          success: false,
           error: 'Unable to read image text / OCR failed',
           explanation: 'Unable to read image text / OCR failed: Failed to extract readable text, line items, or numerical values from uploaded document.',
           status: 'FLAGGED',
@@ -1697,8 +2438,54 @@ app.post('/api/gemini/audit-journal', async (req, res) => {
       ? userIdHeader.replace(/^Bearer\s+/i, '').trim()
       : (payload.userId || payload.uid || 'anonymous');
 
-    // 2. Cryptographic Replay Protection for New Document Ingress
+    // 2. Prompt Injection & Security Constitution Override Defense (OWASP LLM01 / A03)
     const latestUserMsg = messages[messages.length - 1];
+    const latestUserText = (latestUserMsg?.content || latestUserMsg?.text || '') as string;
+    const violationCheck = detectSecurityViolation(latestUserText);
+
+    if (violationCheck.isViolation) {
+      console.warn(`[SECURITY VIOLATION DETECTED] Prompt injection / security override attempt by user ${userId}:`, latestUserText);
+      return res.json({
+        reply: `### 🛡️ FORENSIC AUDIT ALERT & TRANSACTION REJECTION\n\n` +
+          `**AUDIT STATUS**: \`SECURITY VIOLATION DETECTED / AUDIT FAILURE\`\n` +
+          `**THREAT VECTOR**: \`${violationCheck.threatVector || 'ADVERSARIAL_PROMPT_INJECTION'}\`\n\n` +
+          `**Audit Findings**:\n` +
+          `An explicit override attempt was detected and blocked. The system intercepted adversarial instructions attempting to bypass security constraints or authorize direct unauthorized expenses without multi-layer cryptographic and mathematical verification. Direct unauthorized expense authorization is rejected.\n\n` +
+          `**Strategic Recommendation & Ledger Status**:\n` +
+          `Transaction **REJECTED**. This incident has been permanently flagged and logged as a non-compliant audit anomaly in the sovereign vault ledger. Multi-layer verification (Macro Math, Micro Math, Entity Metadata) cannot be bypassed.`,
+        isFraudulent: true,
+        isSecurityViolation: true,
+        status: 'FLAGGED',
+        auditStatus: 'FLAGGED',
+        fraudRiskScore: 'CRITICAL',
+        fraudReason: 'Adversarial Prompt Injection & Security Constitution Override Attempt',
+        totalMismatch: false,
+        taxMismatch: false,
+        lineItemMismatch: false,
+        checks: {
+          macroMath: false,
+          microMath: false,
+          metadataFormat: false,
+          replayProtection: false
+        },
+        toolCalls: [{
+          toolName: 'security_violation_handler',
+          params: {
+            threatVector: violationCheck.threatVector || 'ADVERSARIAL_PROMPT_INJECTION',
+            rawPrompt: latestUserText
+          },
+          result: {
+            isFraudulent: true,
+            status: 'FLAGGED',
+            threatVector: violationCheck.threatVector || 'ADVERSARIAL_PROMPT_INJECTION',
+            action: 'TRANSACTION_REJECTED',
+            reason: 'Attempted to bypass security constitution and authorize bogus expense without verification.'
+          }
+        }]
+      });
+    }
+
+    // 3. Cryptographic Replay Protection for New Document Ingress
     const isNewTurnAttachment = !!(latestUserMsg && latestUserMsg.attachment && latestUserMsg.attachment.data);
 
     const hashResult = computeDocumentBufferHash(payload);
@@ -1713,56 +2500,72 @@ app.post('/api/gemini/audit-journal', async (req, res) => {
         invoiceNumber,
         payload.existingHashes,
         payload.existingInvoiceNumbers,
-        messages
+        messages,
+        payload.audits || payload.existingAudits
       );
 
       if (replayCheck.isDuplicate) {
         console.warn(`[REPLAY ATTACK BLOCKED in Chat Turn] User ${userId} duplicate rejected:`, {
           fileHash,
           invoiceNumber,
-          matchedField: replayCheck.matchedField
+          matchedField: replayCheck.matchedField,
+          matchedRecordId: replayCheck.matchedRecordId
         });
 
-          // Immediately reject replay attempt cleanly with 200 and structured fraud response
-          return res.json({
-            isDuplicate: true,
-            isFraudulent: true,
-            status: 'FLAGGED',
-            fraudReason: 'Duplicate Replay Attack: This exact invoice file or invoice number has already been processed.',
-            reply: '⚠️ **CRITICAL FRAUD REJECTION**: Duplicate Replay Attack detected. This exact invoice file or invoice number has already been processed in your vault ledger.',
-            auditStatus: 'FLAGGED',
-            fraudRiskScore: 'CRITICAL',
-            totalMismatch: false,
-            taxMismatch: false,
-            lineItemMismatch: false,
-            checks: {
-              macroMath: false,
-              microMath: false,
-              metadataFormat: false,
-              replayProtection: false
+        // Immediately reject replay attempt cleanly with 200 and structured fraud response
+        const resolvedInvoiceNo = replayCheck.invoiceNumber || invoiceNumber || 'IDENTIFIER-LOCKED';
+        const resolvedVendor = replayCheck.vendorName || 'Previous Audit Vendor';
+
+        return res.json({
+          isDuplicate: true,
+          isFraudulent: true,
+          status: 'FLAGGED',
+          fraudReason: 'Duplicate Replay Attack: This exact invoice file or invoice number has already been processed.',
+          reply: `⚠️ **CRITICAL FRAUD REJECTION**: Duplicate Replay Attack detected. This exact invoice (${resolvedInvoiceNo}) has already been processed in your vault ledger.`,
+          auditStatus: 'FLAGGED',
+          fraudRiskScore: 'CRITICAL',
+          totalMismatch: false,
+          taxMismatch: false,
+          lineItemMismatch: false,
+          checks: {
+            macroMath: false,
+            microMath: false,
+            metadataFormat: false,
+            replayProtection: false
+          },
+          toolCalls: [{
+            toolName: 'replay_protection_filter',
+            params: {
+              fileHash: replayCheck.fileHash || fileHash || undefined,
+              invoiceNumber: resolvedInvoiceNo,
+              matchedField: replayCheck.matchedField,
+              matchedRecordId: replayCheck.matchedRecordId,
+              matchedSessionId: replayCheck.matchedSessionId,
+              vendorName: resolvedVendor
             },
-            toolCalls: [{
-              toolName: 'replay_protection_filter',
-              params: {
-                fileHash: fileHash || undefined,
-                invoiceNumber: invoiceNumber || undefined,
-                matchedField: replayCheck.matchedField
-              },
-              result: {
-                isFraudulent: true,
-                status: 'FLAGGED',
-                isDuplicate: true,
-                fraudRiskScore: 'CRITICAL',
-                reason: 'Duplicate Replay Attack: This exact invoice file or invoice number has already been processed.',
-                matchedField: replayCheck.matchedField
-              }
-            }],
-            fileHash: fileHash || undefined,
-            invoiceNumber: invoiceNumber || undefined,
-            matchedField: replayCheck.matchedField
-          });
-        }
+            result: {
+              isFraudulent: true,
+              status: 'FLAGGED',
+              isDuplicate: true,
+              fraudRiskScore: 'CRITICAL',
+              reason: 'Duplicate Replay Attack: This exact invoice file or invoice number has already been processed.',
+              matchedField: replayCheck.matchedField,
+              matchedRecordId: replayCheck.matchedRecordId,
+              matchedSessionId: replayCheck.matchedSessionId,
+              vendorName: resolvedVendor,
+              invoiceNumber: resolvedInvoiceNo,
+              fileHash: replayCheck.fileHash || fileHash || undefined
+            }
+          }],
+          matchedRecordId: replayCheck.matchedRecordId,
+          matchedSessionId: replayCheck.matchedSessionId,
+          vendorName: resolvedVendor,
+          fileHash: replayCheck.fileHash || fileHash || undefined,
+          invoiceNumber: resolvedInvoiceNo,
+          matchedField: replayCheck.matchedField
+        });
       }
+    }
 
     // Record into processed replay ledger
     if (fileHash || invoiceNumber) {
@@ -1778,9 +2581,16 @@ app.post('/api/gemini/audit-journal', async (req, res) => {
       const latestMessage = messages[messages.length - 1];
       const latestText = (latestMessage?.content || latestMessage?.text || '') as string;
       const latestAttachment = latestMessage?.attachment;
-      const localInvoice = extractLocalInvoiceData(latestText, latestAttachment);
+      let localInvoice = await extractLocalInvoiceData(latestText, latestAttachment);
 
-      if (localInvoice) {
+      if ((!localInvoice || (localInvoice.subtotal === undefined && localInvoice.statedTotal === undefined)) && latestAttachment) {
+        const ocrRes = await ocr_extraction(latestAttachment, latestText);
+        if (ocrRes.invoiceData && (ocrRes.invoiceData.subtotal !== undefined || ocrRes.invoiceData.statedTotal !== undefined)) {
+          localInvoice = ocrRes.invoiceData;
+        }
+      }
+
+      if (localInvoice && (localInvoice.subtotal !== undefined || localInvoice.statedTotal !== undefined)) {
         const mathResult = executeReconcileMath(localInvoice);
         const hasFraud = mathResult.isFraudulent;
         const status: 'VERIFIED' | 'FLAGGED' = hasFraud ? 'FLAGGED' : 'VERIFIED';
@@ -1789,7 +2599,7 @@ app.post('/api/gemini/audit-journal', async (req, res) => {
           '> *Notice: Deterministic Local Math Engine has verified this transaction with mathematical certainty.*\n',
           `**Transaction**: ${mathResult.itemSummary || 'Financial Item'}`,
           `- **Entity Metadata**: Vendor: ${mathResult.vendorName || 'N/A'} | Tax ID: ${mathResult.taxId || 'N/A'} | PO: ${mathResult.poNumber || 'N/A'}`,
-          `- **Layer 1 (Macro Math)**: Subtotal $${mathResult.subtotal.toFixed(2)} + ${mathResult.taxRate}% Tax ($${mathResult.calculatedTax.toFixed(2)}) = Forensic Total $${mathResult.calculatedTotal.toFixed(2)} (Stated: $${mathResult.statedTotal.toFixed(2)}, Variance: $${mathResult.discrepancy.toFixed(2)}) [${mathResult.checks.macroMath ? 'PASS' : 'FAIL'}]`,
+          `- **Layer 1 (Macro Math)**: Subtotal $${safeToFixed(mathResult.subtotal)} + ${mathResult.taxRate ?? 0}% Tax ($${safeToFixed(mathResult.calculatedTax)}) = Forensic Total $${safeToFixed(mathResult.calculatedTotal)} (Stated: $${safeToFixed(mathResult.statedTotal)}, Variance: $${safeToFixed(mathResult.discrepancy)}) [${mathResult.checks.macroMath ? 'PASS' : 'FAIL'}]`,
           `- **Layer 2 (Micro Math)**: Itemized Line-Item Validation [${mathResult.checks.microMath ? 'PASS' : 'FAIL'}]`,
           `- **Layer 3 (Metadata Format)**: Tax ID & Entity Verification [${mathResult.checks.metadataFormat ? 'PASS' : 'FAIL'}]`,
           `\n**Audit Conclusion**: ${hasFraud ? `⚠️ FRAUD DETECTED - ${mathResult.fraudReason || 'Discrepancy in records'}` : '✅ VERIFIED CLEAN'}\n`,
@@ -1815,9 +2625,10 @@ app.post('/api/gemini/audit-journal', async (req, res) => {
         });
       }
 
-      if (!localInvoice) {
+      if (!localInvoice || (localInvoice.subtotal === undefined && localInvoice.statedTotal === undefined)) {
         if (latestAttachment) {
           return res.status(422).json({
+            success: false,
             reply: '⚠️ **Forensic Audit Error: Unable to read image text / OCR failed**\n\nThe uploaded invoice file could not be processed for readable text or numerical values. Please ensure the document is clear, legible, and uncorrupted.',
             error: 'Unable to read image text / OCR failed',
             ocrFailed: true,
@@ -1965,7 +2776,7 @@ app.post('/api/gemini/audit-journal', async (req, res) => {
 
       // Step 3: Pass tool outputs back to Gemini for the finalized audit summary
       const ai = getGenAI();
-      const priorTurns = formatMessagesToGenAIContents(messages);
+      const priorTurns = await formatMessagesToGenAIContents(messages);
 
       // Preserve candidate content if available, maintaining thought signatures and metadata
       const modelContentTurn = candidate?.content || {
@@ -2085,7 +2896,7 @@ app.post('/api/gemini/audit-journal', async (req, res) => {
           if (r.vendorName || r.taxId || r.poNumber) {
             lines.push(`- **Entity Metadata**: Vendor: ${r.vendorName || 'N/A'} | Tax ID: ${r.taxId || 'N/A'} | PO: ${r.poNumber || 'N/A'}`);
           }
-          lines.push(`- **Layer 1 (Macro Math)**: Subtotal $${r.subtotal.toFixed(2)} + ${r.taxRate}% Tax ($${r.calculatedTax.toFixed(2)}) = Forensic Total $${r.calculatedTotal.toFixed(2)} (Stated: $${r.statedTotal.toFixed(2)}, Variance: $${r.discrepancy.toFixed(2)}) [${r.checks?.macroMath ? 'PASS' : 'FAIL'}]`);
+          lines.push(`- **Layer 1 (Macro Math)**: Subtotal $${safeToFixed(r.subtotal)} + ${r.taxRate ?? 0}% Tax ($${safeToFixed(r.calculatedTax)}) = Forensic Total $${safeToFixed(r.calculatedTotal)} (Stated: $${safeToFixed(r.statedTotal)}, Variance: $${safeToFixed(r.discrepancy)}) [${r.checks?.macroMath ? 'PASS' : 'FAIL'}]`);
           lines.push(`- **Layer 2 (Micro Math)**: Itemized Line-Item Validation [${r.checks?.microMath ? 'PASS' : 'FAIL'}]`);
           lines.push(`- **Layer 3 (Metadata Format)**: Tax ID & Entity Verification [${r.checks?.metadataFormat ? 'PASS' : 'FAIL'}]`);
           lines.push(`- **Audit Conclusion**: ${r.isFraudulent ? `⚠️ FRAUD DETECTED - ${r.fraudReason || 'Discrepancy in financial records'}` : '✅ VERIFIED CLEAN'}\n`);
@@ -2138,7 +2949,31 @@ app.post('/api/gemini/audit-journal', async (req, res) => {
     const latestMessage = messages[messages.length - 1];
     const latestText = (latestMessage?.content || latestMessage?.text || '') as string;
     const latestAttachment = latestMessage?.attachment;
-    const localInvoice = extractLocalInvoiceData(latestText, latestAttachment);
+    let localInvoice = await extractLocalInvoiceData(latestText, latestAttachment);
+
+    // If localInvoice not parsed directly from prompt, check if the LLM output contained extracted financial text
+    if (!localInvoice || (localInvoice.subtotal === undefined && localInvoice.statedTotal === undefined)) {
+      const modelText = initialResult.response.text || '';
+      if (modelText && (latestAttachment || /invoice|subtotal|total|\$\d/i.test(modelText))) {
+        const fromModel = await extractLocalInvoiceData(modelText, latestAttachment);
+        if (fromModel && (fromModel.subtotal !== undefined || fromModel.statedTotal !== undefined)) {
+          localInvoice = fromModel;
+        }
+      }
+    }
+
+    // Vision / OCR Fallback: If localInvoice still not resolved and an attachment is present
+    if ((!localInvoice || (localInvoice.subtotal === undefined && localInvoice.statedTotal === undefined)) && latestAttachment) {
+      const ocrRes = await ocr_extraction(latestAttachment, latestText);
+      if (ocrRes.invoiceData && (ocrRes.invoiceData.subtotal !== undefined || ocrRes.invoiceData.statedTotal !== undefined)) {
+        localInvoice = ocrRes.invoiceData;
+      } else if (ocrRes.normalizedImage && process.env.GEMINI_API_KEY) {
+        const visionExtracted = await extractInvoiceViaGeminiVision(ocrRes.normalizedImage, latestText);
+        if (visionExtracted && (visionExtracted.subtotal !== undefined || visionExtracted.statedTotal !== undefined)) {
+          localInvoice = visionExtracted;
+        }
+      }
+    }
 
     if (localInvoice && (localInvoice.subtotal !== undefined || localInvoice.statedTotal !== undefined)) {
       const mathResult = executeReconcileMath(localInvoice);
@@ -2148,7 +2983,7 @@ app.post('/api/gemini/audit-journal', async (req, res) => {
         `### ${hasFraud ? '⚠️ Sovereign Ledger Forensic Audit: FLAGGED' : '✅ Sovereign Ledger Forensic Audit: VERIFIED CLEAN'}\n`,
         `**Transaction**: ${mathResult.itemSummary || 'Financial Item'}`,
         `- **Entity Metadata**: Vendor: ${mathResult.vendorName || 'N/A'} | Tax ID: ${mathResult.taxId || 'N/A'} | PO: ${mathResult.poNumber || 'N/A'}`,
-        `- **Layer 1 (Macro Math)**: Subtotal $${mathResult.subtotal.toFixed(2)} + ${mathResult.taxRate}% Tax ($${mathResult.calculatedTax.toFixed(2)}) = Forensic Total $${mathResult.calculatedTotal.toFixed(2)} (Stated: $${mathResult.statedTotal.toFixed(2)}, Variance: $${mathResult.discrepancy.toFixed(2)}) [${mathResult.checks.macroMath ? 'PASS' : 'FAIL'}]`,
+        `- **Layer 1 (Macro Math)**: Subtotal $${safeToFixed(mathResult.subtotal)} + ${mathResult.taxRate ?? 0}% Tax ($${safeToFixed(mathResult.calculatedTax)}) = Forensic Total $${safeToFixed(mathResult.calculatedTotal)} (Stated: $${safeToFixed(mathResult.statedTotal)}, Variance: $${safeToFixed(mathResult.discrepancy)}) [${mathResult.checks.macroMath ? 'PASS' : 'FAIL'}]`,
         `- **Layer 2 (Micro Math)**: Itemized Line-Item Validation [${mathResult.checks.microMath ? 'PASS' : 'FAIL'}]`,
         `- **Layer 3 (Metadata Format)**: Tax ID & Entity Verification [${mathResult.checks.metadataFormat ? 'PASS' : 'FAIL'}]`,
         `\n**Audit Conclusion**: ${hasFraud ? `⚠️ FRAUD / DISCREPANCY DETECTED - ${mathResult.fraudReason || 'Discrepancy in records'}` : '✅ VERIFIED CLEAN'}\n`,
@@ -2178,6 +3013,7 @@ app.post('/api/gemini/audit-journal', async (req, res) => {
     // Otherwise general reflection / brainstorming
     if (latestAttachment) {
       return res.status(422).json({
+        success: false,
         reply: '⚠️ **Forensic Audit Error: Unable to read image text / OCR failed**\n\nThe uploaded invoice image or PDF could not be processed for text, line items, or numerical values. Please ensure the document is clear, legible, and uncorrupted.',
         error: 'Unable to read image text / OCR failed',
         ocrFailed: true,
@@ -2211,9 +3047,21 @@ app.post('/api/gemini/audit-journal', async (req, res) => {
       const latestText = (latestMessage?.content || latestMessage?.text || '') as string;
       const latestAttachment = latestMessage?.attachment;
 
-      const localInvoice = extractLocalInvoiceData(latestText, latestAttachment);
+      let localInvoice = await extractLocalInvoiceData(latestText, latestAttachment);
 
-      if (localInvoice) {
+      if ((!localInvoice || (localInvoice.subtotal === undefined && localInvoice.statedTotal === undefined)) && latestAttachment) {
+        const ocrRes = await ocr_extraction(latestAttachment, latestText);
+        if (ocrRes.invoiceData && (ocrRes.invoiceData.subtotal !== undefined || ocrRes.invoiceData.statedTotal !== undefined)) {
+          localInvoice = ocrRes.invoiceData;
+        } else if (ocrRes.normalizedImage && process.env.GEMINI_API_KEY) {
+          const visionExtracted = await extractInvoiceViaGeminiVision(ocrRes.normalizedImage, latestText);
+          if (visionExtracted && (visionExtracted.subtotal !== undefined || visionExtracted.statedTotal !== undefined)) {
+            localInvoice = visionExtracted;
+          }
+        }
+      }
+
+      if (localInvoice && (localInvoice.subtotal !== undefined || localInvoice.statedTotal !== undefined)) {
         // Execute deterministic math engine directly
         const mathResult = executeReconcileMath(localInvoice);
         const toolCalls = [{
@@ -2229,7 +3077,7 @@ app.post('/api/gemini/audit-journal', async (req, res) => {
           '> *Notice: External API rate-limit / quota threshold reached. Deterministic Local Math Engine has verified this transaction with mathematical certainty.*\n',
           `**Transaction**: ${mathResult.itemSummary || 'Financial Item'}`,
           `- **Entity Metadata**: Vendor: ${mathResult.vendorName || 'N/A'} | Tax ID: ${mathResult.taxId || 'N/A'} | PO: ${mathResult.poNumber || 'N/A'}`,
-          `- **Layer 1 (Macro Math)**: Subtotal $${mathResult.subtotal.toFixed(2)} + ${mathResult.taxRate}% Tax ($${mathResult.calculatedTax.toFixed(2)}) = Forensic Total $${mathResult.calculatedTotal.toFixed(2)} (Stated: $${mathResult.statedTotal.toFixed(2)}, Variance: $${mathResult.discrepancy.toFixed(2)}) [${mathResult.checks.macroMath ? 'PASS' : 'FAIL'}]`,
+          `- **Layer 1 (Macro Math)**: Subtotal $${safeToFixed(mathResult.subtotal)} + ${mathResult.taxRate ?? 0}% Tax ($${safeToFixed(mathResult.calculatedTax)}) = Forensic Total $${safeToFixed(mathResult.calculatedTotal)} (Stated: $${safeToFixed(mathResult.statedTotal)}, Variance: $${safeToFixed(mathResult.discrepancy)}) [${mathResult.checks.macroMath ? 'PASS' : 'FAIL'}]`,
           `- **Layer 2 (Micro Math)**: Itemized Line-Item Validation [${mathResult.checks.microMath ? 'PASS' : 'FAIL'}]`,
           `- **Layer 3 (Metadata Format)**: Tax ID & Entity Verification [${mathResult.checks.metadataFormat ? 'PASS' : 'FAIL'}]`,
           `\n**Audit Conclusion**: ${hasFraud ? `⚠️ FRAUD DETECTED - ${mathResult.fraudReason || 'Discrepancy in records'}` : '✅ VERIFIED CLEAN'}\n`,
@@ -2255,6 +3103,7 @@ app.post('/api/gemini/audit-journal', async (req, res) => {
       // If attachment was present but OCR and text extraction failed to parse any numbers
       if (!localInvoice && latestAttachment) {
         return res.status(422).json({
+          success: false,
           reply: '⚠️ **Forensic Audit Error: Unable to read image text / OCR failed**\n\nThe uploaded invoice image or PDF could not be processed for text or numerical values. Please ensure the document is clear, legible, and uncorrupted.',
           error: 'Unable to read image text / OCR failed',
           ocrFailed: true,
@@ -2784,6 +3633,28 @@ app.delete(['/api/vault/records/:recordId', '/api/audits/:recordId', '/api/audit
   }
 });
 
+// 404 handler for API routes - guarantees no API request ever falls through to HTML index.html
+app.all('/api/*', (req, res) => {
+  return res.status(404).json({
+    error: `API route not found: ${req.method} ${req.originalUrl}`,
+    success: false,
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Global API error handler - guarantees JSON error responses for any unhandled exceptions
+app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  console.error('[API Server Global Error]:', err);
+  if (res.headersSent) {
+    return next(err);
+  }
+  return res.status(err.status || err.statusCode || 500).json({
+    error: err?.message || 'Internal Server Error',
+    success: false,
+    timestamp: new Date().toISOString()
+  });
+});
+
 // Vite middleware & Production Serving
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
@@ -2791,7 +3662,7 @@ async function startServer() {
       server: { middlewareMode: true },
       appType: 'spa',
     });
-    app.use(vite.middlewares);
+    app.use(vite.middlewares as any);
   } else {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
@@ -2808,3 +3679,4 @@ async function startServer() {
 }
 
 startServer();
+

@@ -21,6 +21,7 @@ import {
   ShieldX
 } from 'lucide-react';
 import type { ChatMessage, MessageAttachment, AuditVaultEntry } from '../types';
+import { safeToFixed } from '../lib/sanitizer';
 
 interface JournalChatProps {
   messages: ChatMessage[];
@@ -78,10 +79,10 @@ export const JournalChat: React.FC<JournalChatProps> = ({
 
   // Format file size nicely
   const formatFileSize = (bytes?: number) => {
-    if (!bytes) return '';
+    if (!bytes || isNaN(bytes)) return '';
     if (bytes < 1024) return `${bytes} B`;
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+    if (bytes < 1024 * 1024) return `${safeToFixed(bytes / 1024, 1)} KB`;
+    return `${safeToFixed(bytes / (1024 * 1024), 1)} MB`;
   };
 
   // Handle Drag & Drop for Text / PDF / Image Invoices
@@ -337,19 +338,79 @@ export const JournalChat: React.FC<JournalChatProps> = ({
                 {msg.toolCalls && msg.toolCalls.length > 0 && (
                   <div className="w-full max-w-3xl space-y-2 mt-1">
                     {msg.toolCalls.map((tc, idx) => {
-                      const res = tc.result;
+                      const res = tc.result || {};
                       const isReplayBlock = tc.toolName === 'replay_protection_filter' || (res.reason?.includes('Duplicate Replay') ?? false);
+
+                      // If this is an adversarial prompt injection or security violation block
+                      if (tc.toolName === 'security_violation_handler' || res.threatVector || res.reason?.includes('bypass security constitution')) {
+                        const threatVector = tc.params?.threatVector || res.threatVector || 'ADVERSARIAL_PROMPT_INJECTION';
+                        return (
+                          <div
+                            key={idx}
+                            className="p-4 rounded-xl border border-red-500 bg-red-950/70 text-red-200 font-mono text-xs space-y-3 shadow-xl shadow-red-950/50"
+                          >
+                            <div className="flex items-center justify-between">
+                              <div className="flex items-center gap-2 font-bold text-red-400">
+                                <ShieldAlert className="w-4 h-4 text-red-400 shrink-0" />
+                                <span>SECURITY CONSTITUTION VIOLATION INTERCEPTED</span>
+                              </div>
+                              <span className="px-2.5 py-0.5 rounded text-[10px] font-bold bg-red-500/30 text-red-200 border border-red-500/50 animate-pulse">
+                                THREAT BLOCKED
+                              </span>
+                            </div>
+
+                            <div className="p-3 rounded-lg bg-zinc-950/90 border border-red-900/80 text-[11px] space-y-2">
+                              <div className="text-red-300 font-sans font-medium">
+                                <strong>Adversarial Threat Blocked:</strong> An explicit attempt to bypass the Sovereign Ledger Security Constitution was intercepted. Direct unauthorized expense approvals without multi-layer cryptographic and mathematical verification are strictly prohibited.
+                              </div>
+                              <div className="flex flex-wrap gap-2 text-[10px]">
+                                <span className="px-2.5 py-1 rounded bg-red-950 border border-red-800 text-red-300">
+                                  Threat Vector: <strong className="text-white">{threatVector}</strong>
+                                </span>
+                                <span className="px-2.5 py-1 rounded bg-zinc-900 border border-zinc-800 text-zinc-300">
+                                  Action: <strong className="text-red-400">TRANSACTION_REJECTED</strong>
+                                </span>
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      }
                       
                       // If this is a duplicate replay protection block, render high-contrast alert card with vault link
                       if (isReplayBlock) {
-                        const targetNumber = (tc.params.invoiceNumber || res.poNumber || res.invoiceNumber || '').toLowerCase().trim();
-                        const targetHash = (tc.params.fileHash || res.fileHash || '').toLowerCase().trim();
+                        const matchedRecordId = tc.params?.matchedRecordId || res.matchedRecordId || tc.params?.matchedSessionId || res.matchedSessionId;
+                        const displayVendor = tc.params?.vendorName || res.vendorName || '';
+                        const rawInvoiceNo = tc.params?.invoiceNumber || res.poNumber || res.invoiceNumber || '';
+                        const displayInvoiceNumber = rawInvoiceNo && !rawInvoiceNo.includes('sessionMessage') && !rawInvoiceNo.includes('{') ? rawInvoiceNo : '';
+                        const displayHash = tc.params?.fileHash || res.fileHash || '';
                         
+                        const rawMatchedField = tc.params?.matchedField || res.matchedField || '';
+                        const humanMatchedField = rawMatchedField === 'fileHash' ? 'Document Fingerprint (Duplicate File)'
+                          : rawMatchedField === 'invoiceNumber' ? 'Invoice / PO Number'
+                          : rawMatchedField === 'activeSessionHash' ? 'Active Session Document'
+                          : rawMatchedField === 'activeSessionInvoice' ? 'Active Session Ledger'
+                          : (rawMatchedField.startsWith('sessionMessage') ? 'Session Ledger Reference' : rawMatchedField);
+
                         const matchedAudit = audits.find(a => {
-                          if (targetHash && a.fileHash && a.fileHash.toLowerCase().trim() === targetHash) return true;
-                          if (targetNumber && a.invoiceNumber && a.invoiceNumber.toLowerCase().trim() === targetNumber) return true;
+                          if (matchedRecordId && a.id === matchedRecordId) return true;
+                          if (displayHash && a.fileHash && a.fileHash.toLowerCase().trim() === displayHash.toLowerCase().trim()) return true;
+                          if (displayInvoiceNumber && a.invoiceNumber && a.invoiceNumber.toLowerCase().trim() === displayInvoiceNumber.toLowerCase().trim()) return true;
+                          if (displayInvoiceNumber && a.poNumber && a.poNumber.toLowerCase().trim() === displayInvoiceNumber.toLowerCase().trim()) return true;
                           return false;
                         });
+
+                        const targetRecordForNavigation = matchedAudit || (matchedRecordId ? {
+                          id: matchedRecordId,
+                          title: displayVendor ? `${displayVendor} (Invoice #${displayInvoiceNumber || matchedRecordId.slice(0, 8)})` : `Ledger Audit Record (${displayInvoiceNumber || matchedRecordId.slice(0, 8)})`,
+                          filename: 'invoice_document.pdf',
+                          timestamp: new Date().toISOString(),
+                          statedTotal: 0,
+                          isFraudulent: false,
+                          status: 'VERIFIED' as const,
+                          category: 'FINANCIAL_AUDIT' as const,
+                          invoiceNumber: displayInvoiceNumber || undefined,
+                          vendorName: displayVendor || undefined
+                        } : null);
 
                         return (
                           <div
@@ -358,7 +419,7 @@ export const JournalChat: React.FC<JournalChatProps> = ({
                           >
                             <div className="flex items-center justify-between">
                               <div className="flex items-center gap-2 font-bold text-red-400">
-                                <ShieldX className="w-4 h-4 text-red-400" />
+                                <ShieldX className="w-4 h-4 text-red-400 shrink-0" />
                                 <span>REPLAY ATTACK REJECTION: replay_protection_filter()</span>
                               </div>
                               <span className="px-2.5 py-0.5 rounded text-[10px] font-bold bg-red-500/20 text-red-300 border border-red-500/40 animate-pulse">
@@ -366,42 +427,53 @@ export const JournalChat: React.FC<JournalChatProps> = ({
                               </span>
                             </div>
 
-                            <div className="p-3 rounded-lg bg-zinc-950/80 border border-red-900/60 text-[11px] space-y-2">
-                              <div className="text-red-300 font-sans font-medium">
-                                <strong>Security Alert:</strong> This invoice or cryptographic file hash has already been audited and sealed in your ledger. Further processing was halted to protect financial integrity.
+                            <div className="p-3 rounded-lg bg-zinc-950/80 border border-red-900/60 text-[11px] space-y-2.5">
+                              <div className="text-red-300 font-sans font-medium leading-relaxed">
+                                <strong>Security Alert:</strong> This invoice has already been audited and sealed in your sovereign ledger. Further processing was halted to protect financial integrity.
                               </div>
                               
                               <div className="flex flex-wrap gap-2 text-[10px]">
-                                {(tc.params.invoiceNumber || res.poNumber) && (
-                                  <span className="px-2 py-0.5 rounded bg-red-950 border border-red-800 text-red-300">
-                                    Invoice/PO #: <strong>{tc.params.invoiceNumber || res.poNumber}</strong>
+                                {displayInvoiceNumber && (
+                                  <span className="px-2.5 py-1 rounded bg-red-950/90 border border-red-800 text-red-200">
+                                    Invoice/PO #: <strong className="text-white">{displayInvoiceNumber}</strong>
                                   </span>
                                 )}
-                                {(tc.params.fileHash || res.fileHash) && (
-                                  <span className="px-2 py-0.5 rounded bg-zinc-900 border border-zinc-800 text-zinc-400 font-mono">
-                                    Hash: {(tc.params.fileHash || res.fileHash)?.slice(0, 16)}...
+                                {displayVendor && (
+                                  <span className="px-2.5 py-1 rounded bg-zinc-900 border border-zinc-800 text-zinc-300">
+                                    Vendor: <strong className="text-white">{displayVendor}</strong>
                                   </span>
                                 )}
-                                {tc.params.matchedField && (
-                                  <span className="px-2 py-0.5 rounded bg-zinc-900 border border-zinc-800 text-amber-300">
-                                    Matched: {tc.params.matchedField}
+                                {humanMatchedField && (
+                                  <span className="px-2.5 py-1 rounded bg-amber-950/50 border border-amber-800/60 text-amber-300">
+                                    Matched Category: <strong>{humanMatchedField}</strong>
                                   </span>
                                 )}
                               </div>
                             </div>
 
-                            {matchedAudit && onSelectAudit && (
-                              <div className="pt-1 flex items-center justify-between">
-                                <span className="text-[11px] text-zinc-400">
-                                  Existing Vault Record: <strong className="text-zinc-200">{matchedAudit.title}</strong>
+                            {onSelectAudit && (
+                              <div className="pt-2 border-t border-red-900/40 flex items-center justify-between gap-3">
+                                <span className="text-[11px] text-zinc-400 truncate">
+                                  {targetRecordForNavigation ? (
+                                    <>Existing Vault Record: <strong className="text-zinc-200">{targetRecordForNavigation.title}</strong></>
+                                  ) : (
+                                    <span>Existing Vault Entry: <strong className="text-zinc-300">{displayInvoiceNumber ? `Invoice #${displayInvoiceNumber}` : 'Recorded in Ledger'}</strong></span>
+                                  )}
                                 </span>
                                 <button
                                   type="button"
-                                  onClick={() => onSelectAudit(matchedAudit)}
-                                  className="flex items-center gap-1.5 px-3 py-1 rounded-lg bg-red-900/40 hover:bg-red-800/60 border border-red-700 text-red-200 text-xs font-semibold transition"
+                                  id="btn-view-existing-ledger-record"
+                                  onClick={() => {
+                                    if (targetRecordForNavigation) {
+                                      onSelectAudit(targetRecordForNavigation as any);
+                                    } else if (audits.length > 0) {
+                                      onSelectAudit(audits[0]);
+                                    }
+                                  }}
+                                  className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-red-600 hover:bg-red-500 text-white font-medium text-xs shadow-md shadow-red-950/50 transition cursor-pointer border border-red-400/30"
                                 >
                                   <ExternalLink className="w-3.5 h-3.5" />
-                                  <span>View Existing Record</span>
+                                  <span>View Existing Ledger Record</span>
                                 </button>
                               </div>
                             )}
@@ -515,20 +587,20 @@ export const JournalChat: React.FC<JournalChatProps> = ({
                           <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-1 text-[11px] text-zinc-300">
                             <div className="p-2 rounded bg-zinc-950/60 border border-zinc-800">
                               <span className="text-zinc-500 block">Subtotal</span>
-                              <span className="font-bold">${res.subtotal.toFixed(2)}</span>
+                              <span className="font-bold">${safeToFixed(res.subtotal)}</span>
                             </div>
                             <div className="p-2 rounded bg-zinc-950/60 border border-zinc-800">
-                              <span className="text-zinc-500 block">Tax ({res.taxRate}%)</span>
-                              <span className="font-bold">${res.calculatedTax.toFixed(2)}</span>
+                              <span className="text-zinc-500 block">Tax ({res.taxRate ?? 0}%)</span>
+                              <span className="font-bold">${safeToFixed(res.calculatedTax)}</span>
                             </div>
                             <div className="p-2 rounded bg-zinc-950/60 border border-zinc-800">
                               <span className="text-zinc-500 block">Calc Total</span>
-                              <span className="font-bold text-emerald-400">${res.calculatedTotal.toFixed(2)}</span>
+                              <span className="font-bold text-emerald-400">${safeToFixed(res.calculatedTotal)}</span>
                             </div>
                             <div className="p-2 rounded bg-zinc-950/60 border border-zinc-800">
                               <span className="text-zinc-500 block">Variance</span>
-                              <span className={`font-bold ${res.discrepancy > 0.01 ? 'text-red-400' : 'text-emerald-400'}`}>
-                                ${res.discrepancy.toFixed(2)}
+                              <span className={`font-bold ${(res.discrepancy ?? 0) > 0.01 ? 'text-red-400' : 'text-emerald-400'}`}>
+                                ${safeToFixed(res.discrepancy)}
                               </span>
                             </div>
                           </div>
@@ -539,7 +611,7 @@ export const JournalChat: React.FC<JournalChatProps> = ({
                               <div className="text-[10px] text-zinc-400 font-semibold flex items-center justify-between">
                                 <span>Itemized Line Audit ({res.lineItems.length} rows)</span>
                                 {res.sumOfLineItems !== undefined && (
-                                  <span>Sum: ${res.sumOfLineItems.toFixed(2)}</span>
+                                  <span>Sum: ${safeToFixed(res.sumOfLineItems)}</span>
                                 )}
                               </div>
                               <div className="divide-y divide-zinc-850 text-[11px]">
@@ -547,13 +619,13 @@ export const JournalChat: React.FC<JournalChatProps> = ({
                                   <div key={lidx} className="py-1 flex items-center justify-between">
                                     <div className="truncate max-w-[50%]">
                                       <span className="text-zinc-300">{li.description}</span>
-                                      <span className="text-zinc-500 text-[10px] ml-1.5">({li.qty} @ ${li.unitPrice.toFixed(2)})</span>
+                                      <span className="text-zinc-500 text-[10px] ml-1.5">({li.qty} @ ${safeToFixed(li.unitPrice)})</span>
                                     </div>
                                     <div className="flex items-center gap-2">
-                                      <span className="text-zinc-300 font-mono">${li.rowTotal.toFixed(2)}</span>
+                                      <span className="text-zinc-300 font-mono">${safeToFixed(li.rowTotal)}</span>
                                       {li.rowMismatch ? (
                                         <span className="px-1.5 py-0.2 rounded bg-red-950 border border-red-800 text-red-400 text-[9px] font-bold">
-                                          MISMATCH (calc: ${li.calculatedRowTotal.toFixed(2)})
+                                          MISMATCH (calc: ${safeToFixed(li.calculatedRowTotal)})
                                         </span>
                                       ) : (
                                         <span className="px-1.5 py-0.2 rounded bg-emerald-950 border border-emerald-800 text-emerald-400 text-[9px]">

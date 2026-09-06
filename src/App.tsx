@@ -265,6 +265,13 @@ export default function App() {
           auditId: selectedAudit?.id,
           existingHashes,
           existingInvoiceNumbers,
+          audits: otherAudits.map(a => ({
+            id: a.id,
+            fileHash: a.fileHash,
+            invoiceNumber: a.invoiceNumber,
+            vendorName: a.vendorName || a.title,
+            title: a.title
+          })),
           messages: updatedMessages.map(m => ({ 
             role: m.role, 
             content: m.content,
@@ -406,18 +413,46 @@ export default function App() {
             params: {
               fileHash: data.fileHash,
               invoiceNumber: data.invoiceNumber,
-              matchedField: data.matchedField
+              matchedField: data.matchedField,
+              matchedRecordId: data.matchedRecordId,
+              matchedSessionId: data.matchedSessionId,
+              vendorName: data.vendorName
             },
             result: {
               isFraudulent: true,
-              status: 'DISCREPANCY_FLAGGED',
+              status: 'FLAGGED',
               fraudRiskScore: 'CRITICAL',
-              reason: fraudReason
+              reason: fraudReason,
+              matchedRecordId: data.matchedRecordId,
+              matchedSessionId: data.matchedSessionId,
+              vendorName: data.vendorName,
+              invoiceNumber: data.invoiceNumber,
+              fileHash: data.fileHash
             }
           }]
         };
 
         setMessages([...updatedMessages, fraudAssistantMessage]);
+        return;
+      }
+
+      // If server returned security violation (prompt injection intercept)
+      if (data.isSecurityViolation) {
+        setNotification({
+          type: 'error',
+          message: '🛡️ Security Violation Blocked: Prompt override attempt detected.'
+        });
+
+        const securityAssistantMessage: ChatMessage = {
+          id: `msg_${Date.now()}_security_violation`,
+          role: 'assistant',
+          content: data.reply,
+          timestamp: new Date().toISOString(),
+          isAuditAlert: true,
+          toolCalls: data.toolCalls || []
+        };
+
+        setMessages([...updatedMessages, securityAssistantMessage]);
         return;
       }
 

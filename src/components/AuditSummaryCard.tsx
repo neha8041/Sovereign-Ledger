@@ -22,6 +22,7 @@ import {
   RefreshCw
 } from 'lucide-react';
 import type { AuditVaultEntry, ReconcileInvoiceResult } from '../types';
+import { safeToFixed } from '../lib/sanitizer';
 
 interface AuditSummaryCardProps {
   audit: AuditVaultEntry;
@@ -237,8 +238,8 @@ export const AuditSummaryCard: React.FC<AuditSummaryCardProps> = ({
           doc.text(`Vendor: ${rec.vendorName || 'N/A'}  |  Tax ID: ${rec.taxId || 'N/A'}  |  PO #: ${rec.poNumber || 'N/A'}`, margin + 4, y + 11);
 
           // Math numbers
-          doc.text(`Subtotal: $${rec.subtotal.toFixed(2)}  |  Tax Rate: ${rec.taxRate}% ($${rec.calculatedTax.toFixed(2)})  |  Forensic Total: $${rec.calculatedTotal.toFixed(2)}`, margin + 4, y + 16);
-          doc.text(`Stated Total: $${rec.statedTotal.toFixed(2)}  |  Discrepancy: $${rec.discrepancy.toFixed(2)}`, margin + 4, y + 21);
+          doc.text(`Subtotal: $${safeToFixed(rec.subtotal)}  |  Tax Rate: ${rec.taxRate ?? 0}% ($${safeToFixed(rec.calculatedTax)})  |  Forensic Total: $${safeToFixed(rec.calculatedTotal)}`, margin + 4, y + 16);
+          doc.text(`Stated Total: $${safeToFixed(rec.statedTotal)}  |  Discrepancy: $${safeToFixed(rec.discrepancy)}`, margin + 4, y + 21);
 
           // Verification Checks
           const macroCheck = rec.checks?.macroMath ? 'PASS' : 'FAIL';
@@ -305,7 +306,7 @@ ${(audit.actionItems || []).map(a => `- [ ] ${a}`).join('\n')}
 ${audit.financialReconciliations.map((r, i) => `
 ### Line Item #${i + 1}: ${r.vendorName ? `${r.vendorName} - ` : ''}${r.itemSummary || 'Financial Item'}
 - **Vendor:** ${r.vendorName || 'N/A'} | **Tax ID:** ${r.taxId || 'N/A'} | **PO #:** ${r.poNumber || 'N/A'}
-- **Macro Math:** Subtotal $${r.subtotal.toFixed(2)} + ${r.taxRate}% Tax ($${r.calculatedTax.toFixed(2)}) = Forensic Total $${r.calculatedTotal.toFixed(2)} (Stated: $${r.statedTotal.toFixed(2)}, Variance: $${r.discrepancy.toFixed(2)})
+- **Macro Math:** Subtotal $${safeToFixed(r.subtotal)} + ${r.taxRate ?? 0}% Tax ($${safeToFixed(r.calculatedTax)}) = Forensic Total $${safeToFixed(r.calculatedTotal)} (Stated: $${safeToFixed(r.statedTotal)}, Variance: $${safeToFixed(r.discrepancy)})
 - **Checks:** Macro Math: ${r.checks?.macroMath ? 'PASS' : 'FAIL'} | Micro Math: ${r.checks?.microMath ? 'PASS' : 'FAIL'} | Tax ID Format: ${r.checks?.metadataFormat ? 'PASS' : 'FAIL'}
 - **Fraud Status:** ${r.isFraudulent ? `FRAUD DETECTED (${r.fraudReason || 'Failed checks'})` : 'VERIFIED CLEAN'}
 - **Forensic Note:** ${r.explanation}
@@ -526,12 +527,12 @@ ${audit.financialReconciliations.map((r, i) => `
                         </div>
                       )}
                     </td>
-                    <td className="p-2.5 text-zinc-300">${rec.subtotal.toFixed(2)}</td>
-                    <td className="p-2.5 text-zinc-400">{rec.taxRate}% (${rec.calculatedTax.toFixed(2)})</td>
-                    <td className="p-2.5 font-semibold text-emerald-400">${rec.calculatedTotal.toFixed(2)}</td>
-                    <td className="p-2.5 text-zinc-300">${rec.statedTotal.toFixed(2)}</td>
-                    <td className={`p-2.5 font-bold ${rec.discrepancy > 0.01 ? 'text-red-400' : 'text-emerald-400'}`}>
-                      ${rec.discrepancy.toFixed(2)}
+                    <td className="p-2.5 text-zinc-300">${safeToFixed(rec.subtotal)}</td>
+                    <td className="p-2.5 text-zinc-400">{rec.taxRate ?? 0}% (${safeToFixed(rec.calculatedTax)})</td>
+                    <td className="p-2.5 font-semibold text-emerald-400">${safeToFixed(rec.calculatedTotal)}</td>
+                    <td className="p-2.5 text-zinc-300">${safeToFixed(rec.statedTotal)}</td>
+                    <td className={`p-2.5 font-bold ${(rec.discrepancy ?? 0) > 0.01 ? 'text-red-400' : 'text-emerald-400'}`}>
+                      ${safeToFixed(rec.discrepancy)}
                     </td>
                     <td className="p-2.5">
                       {rec.status === 'VERIFIED' && !rec.isFraudulent ? (

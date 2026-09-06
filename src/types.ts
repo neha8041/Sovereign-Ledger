@@ -24,6 +24,10 @@ export interface ReconcileInvoiceParams {
   fileName?: string;
   bankingDetails?: string;
   matchedField?: string;
+  matchedRecordId?: string;
+  matchedSessionId?: string;
+  threatVector?: string;
+  rawPrompt?: string;
   subtotal?: number;
   taxRate?: number;
   statedTax?: number;
@@ -39,6 +43,9 @@ export interface ReconcileInvoiceResult {
   poNumber?: string;
   invoiceNumber?: string;
   fileHash?: string;
+  matchedRecordId?: string;
+  matchedSessionId?: string;
+  threatVector?: string;
   bankingDetails?: string;
   subtotal?: number;
   taxRate?: number;
@@ -53,7 +60,7 @@ export interface ReconcileInvoiceResult {
   taxMismatch?: boolean;
   lineItemMismatch?: boolean;
   isDuplicate?: boolean;
-  isFraudulent: boolean;
+  isFraudulent?: boolean;
   fraudReason?: string | null;
   fraudRiskScore?: FraudRiskScore;
   reason?: string;
@@ -63,9 +70,11 @@ export interface ReconcileInvoiceResult {
     metadataFormat?: boolean;
     replayProtection?: boolean;
   };
-  status: 'VERIFIED' | 'DISCREPANCY_FLAGGED' | 'FLAGGED';
+  status?: 'VERIFIED' | 'DISCREPANCY_FLAGGED' | 'FLAGGED';
   explanation?: string;
   itemSummary?: string;
+  action?: string;
+  [key: string]: any;
 }
 
 export interface MessageAttachment {
@@ -83,8 +92,8 @@ export interface ChatMessage {
   attachment?: MessageAttachment;
   toolCalls?: {
     toolName: string;
-    params: ReconcileInvoiceParams;
-    result: ReconcileInvoiceResult;
+    params: any;
+    result: any;
   }[];
   isAuditAlert?: boolean;
 }
@@ -109,6 +118,8 @@ export interface AuditVaultEntry {
   confidenceScore?: number;
   fileHash?: string;
   invoiceNumber?: string;
+  poNumber?: string;
+  vendorName?: string;
   filename?: string;
   isFraudulent?: boolean;
   statedTotal?: number;
