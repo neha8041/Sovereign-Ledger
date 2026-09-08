@@ -23,6 +23,38 @@ import {
 import type { ChatMessage, MessageAttachment, AuditVaultEntry } from '../types';
 import { safeToFixed } from '../lib/sanitizer';
 
+const formatThreatVector = (raw?: string): string => {
+  if (!raw) return 'Prompt Override Attempt';
+  const str = String(raw).toUpperCase();
+  if (str.includes('PROMPT') || str.includes('INJECTION') || str.includes('OVERRIDE')) return 'Prompt Override Attempt';
+  if (str.includes('SECURITY') || str.includes('CONSTITUTION')) return 'Security Policy Override Attempt';
+  if (str.includes('DIRECT_APPROVAL') || str.includes('BYPASS')) return 'Unauthorized Instruction';
+  if (str.includes('MATH_BYPASS') || str.includes('CALCULATION_BYPASS')) return 'Mathematical Verification Bypass Attempt';
+  return raw.replace(/_/g, ' ').toLowerCase().replace(/\b\w/g, c => c.toUpperCase());
+};
+
+const formatEnforcement = (raw?: string): string => {
+  if (!raw) return 'Unauthorized Expense Blocked';
+  const str = String(raw).toUpperCase();
+  if (
+    str.includes('UNAUTHORIZED') ||
+    str.includes('REJECTED') ||
+    str.includes('PREVENTED') ||
+    str.includes('BLOCKED') ||
+    str.includes('TRANSACTION_REJECTED')
+  ) {
+    return 'Unauthorized Expense Blocked';
+  }
+  return raw.replace(/_/g, ' ').toLowerCase().replace(/\b\w/g, c => c.toUpperCase());
+};
+
+const sanitizeContentForDisplay = (content: string): string => {
+  if (!content) return '';
+  return content
+    .replace(/ADVERSARIAL_PROMPT_INJECTION/g, 'Prompt Override Attempt')
+    .replace(/UNAUTHORIZED_APPROVAL_PREVENTED/g, 'Unauthorized Expense Blocked');
+};
+
 interface JournalChatProps {
   messages: ChatMessage[];
   onSendMessage: (text: string, attachment?: MessageAttachment) => Promise<void>;
@@ -107,7 +139,7 @@ export const JournalChat: React.FC<JournalChatProps> = ({
 
   const handleFileUpload = (file: File) => {
     const isPdf = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
-    const isImage = file.type.startsWith('image/') || /\.(png|jpg|jpeg|webp|gif)$/i.test(file.name);
+    const isImage = file.type.startsWith('image/') || /\.(png|jpg|jpeg|webp|gif|tiff|tif|bmp)$/i.test(file.name);
 
     if (isPdf || isImage) {
       // Determine normalized mimeType
@@ -116,7 +148,10 @@ export const JournalChat: React.FC<JournalChatProps> = ({
         if (isPdf) mimeType = 'application/pdf';
         else if (file.name.toLowerCase().endsWith('.png')) mimeType = 'image/png';
         else if (file.name.toLowerCase().endsWith('.webp')) mimeType = 'image/webp';
+        else if (/\.(tiff|tif)$/i.test(file.name)) mimeType = 'image/tiff';
         else mimeType = 'image/jpeg';
+      } else if (mimeType === 'image/jpg' || mimeType === 'image/pjpeg') {
+        mimeType = 'image/jpeg';
       }
 
       // Encode as Base64 for native Gemini Multimodal & OCR extraction
@@ -329,7 +364,7 @@ export const JournalChat: React.FC<JournalChatProps> = ({
                         )
                       }}
                     >
-                      {msg.content}
+                      {sanitizeContentForDisplay(msg.content)}
                     </ReactMarkdown>
                   </div>
                 </div>
@@ -343,7 +378,8 @@ export const JournalChat: React.FC<JournalChatProps> = ({
 
                       // If this is an adversarial prompt injection or security violation block
                       if (tc.toolName === 'security_violation_handler' || res.threatVector || res.reason?.includes('bypass security constitution')) {
-                        const threatVector = tc.params?.threatVector || res.threatVector || 'ADVERSARIAL_PROMPT_INJECTION';
+                        const threatVector = tc.params?.threatVector || res.threatVector || 'Prompt Override Attempt';
+                        const enforcement = tc.params?.enforcement || res.enforcement || tc.params?.action || res.action || 'UNAUTHORIZED_APPROVAL_PREVENTED';
                         return (
                           <div
                             key={idx}
@@ -352,7 +388,7 @@ export const JournalChat: React.FC<JournalChatProps> = ({
                             <div className="flex items-center justify-between">
                               <div className="flex items-center gap-2 font-bold text-red-400">
                                 <ShieldAlert className="w-4 h-4 text-red-400 shrink-0" />
-                                <span>SECURITY CONSTITUTION VIOLATION INTERCEPTED</span>
+                                <span>SECURITY POLICY VIOLATION INTERCEPTED</span>
                               </div>
                               <span className="px-2.5 py-0.5 rounded text-[10px] font-bold bg-red-500/30 text-red-200 border border-red-500/50 animate-pulse">
                                 THREAT BLOCKED
@@ -361,14 +397,14 @@ export const JournalChat: React.FC<JournalChatProps> = ({
 
                             <div className="p-3 rounded-lg bg-zinc-950/90 border border-red-900/80 text-[11px] space-y-2">
                               <div className="text-red-300 font-sans font-medium">
-                                <strong>Adversarial Threat Blocked:</strong> An explicit attempt to bypass the Sovereign Ledger Security Constitution was intercepted. Direct unauthorized expense approvals without multi-layer cryptographic and mathematical verification are strictly prohibited.
+                                <strong>Adversarial Threat Intercepted:</strong> An unauthorized attempt to circumvent the Sovereign Ledger Security Constitution was blocked. Direct expense approval commands without multi-layer mathematical verification and audit logging are strictly denied.
                               </div>
                               <div className="flex flex-wrap gap-2 text-[10px]">
                                 <span className="px-2.5 py-1 rounded bg-red-950 border border-red-800 text-red-300">
-                                  Threat Vector: <strong className="text-white">{threatVector}</strong>
+                                  Threat Vector: <strong className="text-white">{formatThreatVector(threatVector)}</strong>
                                 </span>
                                 <span className="px-2.5 py-1 rounded bg-zinc-900 border border-zinc-800 text-zinc-300">
-                                  Action: <strong className="text-red-400">TRANSACTION_REJECTED</strong>
+                                  Enforcement: <strong className="text-red-400 font-semibold">{formatEnforcement(enforcement)}</strong>
                                 </span>
                               </div>
                             </div>
@@ -419,17 +455,17 @@ export const JournalChat: React.FC<JournalChatProps> = ({
                           >
                             <div className="flex items-center justify-between">
                               <div className="flex items-center gap-2 font-bold text-red-400">
-                                <ShieldX className="w-4 h-4 text-red-400 shrink-0" />
-                                <span>REPLAY ATTACK REJECTION: replay_protection_filter()</span>
+                                <ShieldAlert className="w-4 h-4 text-red-400 shrink-0" />
+                                <span>DUPLICATE RECORD INTERCEPT</span>
                               </div>
                               <span className="px-2.5 py-0.5 rounded text-[10px] font-bold bg-red-500/20 text-red-300 border border-red-500/40 animate-pulse">
-                                FRAUD BLOCKED
+                                DUPLICATE DETECTED
                               </span>
                             </div>
 
                             <div className="p-3 rounded-lg bg-zinc-950/80 border border-red-900/60 text-[11px] space-y-2.5">
                               <div className="text-red-300 font-sans font-medium leading-relaxed">
-                                <strong>Security Alert:</strong> This invoice has already been audited and sealed in your sovereign ledger. Further processing was halted to protect financial integrity.
+                                <strong>Security Alert:</strong> This invoice has already been audited and sealed in your sovereign ledger. Further processing was halted to protect financial integrity and prevent duplicate disbursement.
                               </div>
                               
                               <div className="flex flex-wrap gap-2 text-[10px]">
@@ -445,9 +481,12 @@ export const JournalChat: React.FC<JournalChatProps> = ({
                                 )}
                                 {humanMatchedField && (
                                   <span className="px-2.5 py-1 rounded bg-amber-950/50 border border-amber-800/60 text-amber-300">
-                                    Matched Category: <strong>{humanMatchedField}</strong>
+                                    Match Type: <strong>{humanMatchedField}</strong>
                                   </span>
                                 )}
+                                <span className="px-2.5 py-1 rounded bg-zinc-900 border border-zinc-800 text-zinc-300">
+                                  Status: <strong className="text-amber-400">SEALED IN VAULT</strong>
+                                </span>
                               </div>
                             </div>
 
@@ -491,18 +530,18 @@ export const JournalChat: React.FC<JournalChatProps> = ({
                             <div className="flex items-center justify-between">
                               <div className="flex items-center gap-2 font-bold text-red-400">
                                 <AlertOctagon className="w-5 h-5 text-red-400 shrink-0" />
-                                <span>OCR EXTRACTION FAILED: ocr_extraction()</span>
+                                <span>OPTICAL CHARACTER RECOGNITION (OCR) NOTICE</span>
                               </div>
                               <span className="px-2.5 py-0.5 rounded text-[10px] font-bold bg-red-500/20 text-red-300 border border-red-500/40">
-                                OCR FAILED
+                                UNREADABLE DOCUMENT
                               </span>
                             </div>
                             <div className="p-3 rounded-lg bg-zinc-950/80 border border-red-900/60 text-[11px] space-y-1">
                               <div className="text-red-300 font-semibold">
-                                Unable to read image text / OCR failed
+                                Unable to parse legible document text or numbers
                               </div>
                               <p className="text-zinc-400 font-sans text-xs">
-                                The uploaded file could not be parsed for readable text, line items, or numerical values. System rejected mock $100.00 fallback to preserve audit integrity.
+                                The uploaded file could not be parsed for readable text, line items, or numerical values. System rejected ungrounded mock values to preserve audit integrity. Please provide a clear, high-resolution document.
                               </p>
                             </div>
                           </div>
@@ -526,7 +565,7 @@ export const JournalChat: React.FC<JournalChatProps> = ({
                               ) : (
                                 <AlertOctagon className="w-4 h-4 text-red-400" />
                               )}
-                              <span>TOOL CALLED: reconcile_invoice_math()</span>
+                              <span>MULTI-LAYER MATHEMATICAL VERIFICATION</span>
                             </div>
                             <span
                               className={`px-2 py-0.5 rounded text-[10px] font-bold ${

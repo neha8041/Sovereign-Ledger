@@ -262,7 +262,7 @@ export default function App() {
         },
         body: JSON.stringify({
           userId: user?.uid,
-          auditId: selectedAudit?.id,
+          auditId: selectedAudit?.id || currentAuditId,
           existingHashes,
           existingInvoiceNumbers,
           audits: otherAudits.map(a => ({

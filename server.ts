@@ -10,6 +10,7 @@ import { initializeApp as initAdminApp, getApps as getAdminApps, getApp as getAd
 import { getFirestore as getAdminFirestore, type Firestore as AdminFirestore } from 'firebase-admin/firestore';
 import { GoogleGenAI, Type, FunctionDeclaration } from '@google/genai';
 import { PDFParse } from 'pdf-parse';
+import Tesseract from 'tesseract.js';
 import { createServer as createViteServer } from 'vite';
 
 dotenv.config();
@@ -336,9 +337,30 @@ export interface OcrExtractionResult {
 }
 
 /**
+ * Executes local OCR on an image buffer using Tesseract.js with safety timeout
+ */
+export async function runLocalTesseractOcr(imageBuffer: Buffer): Promise<string> {
+  try {
+    const ocrPromise = Tesseract.recognize(imageBuffer, 'eng');
+    const timeoutPromise = new Promise<{ data: { text: string } }>((_, reject) => {
+      setTimeout(() => reject(new Error('Tesseract recognition timed out')), 9000);
+    });
+    const res = await Promise.race([ocrPromise, timeoutPromise]);
+    const text = res?.data?.text || '';
+    if (text.trim()) {
+      console.info(`[Tesseract.js OCR] Successfully extracted ${text.trim().length} chars from image`);
+    }
+    return text;
+  } catch (err: any) {
+    console.warn('[Tesseract.js OCR Notice]:', err?.message || err);
+    return '';
+  }
+}
+
+/**
  * Optical Character Recognition (OCR) Extraction Tool & Local Text Extraction:
  * Ingests image or PDF attachment, resolves and decrypts binary buffers, extracts
- * text tokens and parses invoice fields deterministically.
+ * text tokens locally via Tesseract.js & pdf-parse, and parses invoice fields deterministically.
  */
 export async function ocr_extraction(
   attachment?: any,
@@ -353,8 +375,28 @@ export async function ocr_extraction(
       if (pdfRes.text) {
         extractedText += '\n' + pdfRes.text;
       }
+      // If PDF had an embedded scanned image, also attempt local Tesseract OCR on it
+      const embeddedJpeg = extractJpegFromPdf(normalized.buffer);
+      if (embeddedJpeg && (!pdfRes.text || pdfRes.text.trim().length < 50)) {
+        const tessText = await runLocalTesseractOcr(embeddedJpeg);
+        if (tessText && tessText.trim()) {
+          extractedText += '\n' + tessText;
+        }
+      }
     } catch (e: any) {
       console.warn('[ocr_extraction PDF notice]:', e?.message || e);
+    }
+  }
+
+  // If image attachment (PNG, JPEG, WEBP, etc.), run local Tesseract.js OCR
+  if (normalized && normalized.mimeType.startsWith('image/')) {
+    try {
+      const ocrResultText = await runLocalTesseractOcr(normalized.buffer);
+      if (ocrResultText && ocrResultText.trim()) {
+        extractedText += '\n' + ocrResultText;
+      }
+    } catch (e: any) {
+      console.warn('[ocr_extraction Tesseract notice]:', e?.message || e);
     }
   }
 
@@ -497,6 +539,9 @@ Extract the true vendor name and invoice number accurately from the image text.`
     }
   } catch (err: any) {
     console.warn('[extractInvoiceViaGeminiVision Notice]:', err?.message || err);
+    if (isRateLimitError(err)) {
+      throw err;
+    }
   }
 
   return null;
@@ -607,22 +652,47 @@ interface ProcessedAuditRecord {
 }
 const processedReplayLedger = new Map<string, ProcessedAuditRecord[]>();
 
-// Active in-memory session sets for instant duplicate detection within current session
-const sessionHashes = new Set<string>();
-const sessionInvoiceNumbers = new Set<string>();
+// Per-user active in-memory session sets for instant duplicate detection within current user session
+// Guarantees strict multi-tenant session isolation and prevents cross-user context leaks
+const userSessionHashes = new Map<string, Set<string>>();
+const userSessionInvoiceNumbers = new Map<string, Set<string>>();
+
+function getUserSessionHashes(userId: string): Set<string> {
+  const cleanId = (userId || 'anonymous').trim();
+  let set = userSessionHashes.get(cleanId);
+  if (!set) {
+    set = new Set<string>();
+    userSessionHashes.set(cleanId, set);
+  }
+  return set;
+}
+
+function getUserSessionInvoiceNumbers(userId: string): Set<string> {
+  const cleanId = (userId || 'anonymous').trim();
+  let set = userSessionInvoiceNumbers.get(cleanId);
+  if (!set) {
+    set = new Set<string>();
+    userSessionInvoiceNumbers.set(cleanId, set);
+  }
+  return set;
+}
 
 function recordProcessedAudit(userId: string, auditId?: string, fileHash?: string | null, invoiceNumber?: string | null, vendorName?: string | null) {
   if (!userId) return;
+  const cleanUserId = userId.trim();
   const cleanHash = fileHash ? fileHash.toLowerCase().trim() : undefined;
   const cleanInv = invoiceNumber ? invoiceNumber.toLowerCase().trim() : undefined;
 
-  if (cleanHash) sessionHashes.add(cleanHash);
-  if (cleanInv) sessionInvoiceNumbers.add(cleanInv);
+  const uHashes = getUserSessionHashes(cleanUserId);
+  const uInvoices = getUserSessionInvoiceNumbers(cleanUserId);
 
-  let records = processedReplayLedger.get(userId);
+  if (cleanHash) uHashes.add(cleanHash);
+  if (cleanInv) uInvoices.add(cleanInv);
+
+  let records = processedReplayLedger.get(cleanUserId);
   if (!records) {
     records = [];
-    processedReplayLedger.set(userId, records);
+    processedReplayLedger.set(cleanUserId, records);
   }
   records.push({
     auditId: auditId || undefined,
@@ -635,23 +705,43 @@ function recordProcessedAudit(userId: string, auditId?: string, fileHash?: strin
 
 function purgeProcessedAudit(userId: string, auditId?: string, fileHash?: string | null, invoiceNumber?: string | null) {
   if (!userId) return;
+  const cleanUserId = userId.trim();
   const cleanHash = fileHash ? fileHash.toLowerCase().trim() : null;
   const cleanInv = invoiceNumber ? invoiceNumber.toLowerCase().trim() : null;
 
-  if (cleanHash) sessionHashes.delete(cleanHash);
-  if (cleanInv) sessionInvoiceNumbers.delete(cleanInv);
+  const uHashes = getUserSessionHashes(cleanUserId);
+  const uInvoices = getUserSessionInvoiceNumbers(cleanUserId);
 
-  const records = processedReplayLedger.get(userId);
+  if (cleanHash) uHashes.delete(cleanHash);
+  if (cleanInv) uInvoices.delete(cleanInv);
+
+  // Check serverAuditStore as well to discover hash/invoiceNumber if not passed
+  if (auditId) {
+    const existingServerRecord = serverAuditStore.get(`${cleanUserId}:${auditId}`) || serverAuditStore.get(auditId);
+    if (existingServerRecord) {
+      if (existingServerRecord.fileHash) uHashes.delete(String(existingServerRecord.fileHash).toLowerCase().trim());
+      if (existingServerRecord.invoiceNumber) uInvoices.delete(String(existingServerRecord.invoiceNumber).toLowerCase().trim());
+    }
+  }
+
+  const records = processedReplayLedger.get(cleanUserId);
   if (!records || records.length === 0) return;
 
-  const filtered = records.filter(rec => {
-    if (auditId && rec.auditId && rec.auditId === auditId) return false;
-    if (cleanHash && rec.fileHash && rec.fileHash === cleanHash) return false;
-    if (cleanInv && rec.invoiceNumber && rec.invoiceNumber === cleanInv) return false;
-    return true;
-  });
+  const remaining: ProcessedAuditRecord[] = [];
+  for (const rec of records) {
+    const matchesAuditId = Boolean(auditId && rec.auditId && rec.auditId === auditId);
+    const matchesHash = Boolean(cleanHash && rec.fileHash && rec.fileHash === cleanHash);
+    const matchesInv = Boolean(cleanInv && rec.invoiceNumber && rec.invoiceNumber === cleanInv);
 
-  processedReplayLedger.set(userId, filtered);
+    if (matchesAuditId || matchesHash || matchesInv) {
+      if (rec.fileHash) uHashes.delete(rec.fileHash);
+      if (rec.invoiceNumber) uInvoices.delete(rec.invoiceNumber);
+    } else {
+      remaining.push(rec);
+    }
+  }
+
+  processedReplayLedger.set(cleanUserId, remaining);
 }
 
 // Calculate SHA-256 hash of an uploaded document buffer (from direct payload or latest user turn)
@@ -755,6 +845,8 @@ export interface ReplayCheckResult {
   matchedField?: string;
   matchedValue?: string;
   matchedRecordId?: string;
+  matchedInvoiceNumber?: string;
+  matchedVendorName?: string;
   matchedSessionId?: string;
   vendorName?: string;
   invoiceNumber?: string;
@@ -775,6 +867,62 @@ function checkDuplicateReplay(
 ): ReplayCheckResult {
   if (!userId) return { isDuplicate: false };
 
+  const cleanUserId = (userId || 'anonymous').trim();
+
+  // Helper to resolve metadata from client audits or server stores
+  const resolveMetadataFromLedger = (hash?: string | null, inv?: string | null) => {
+    let rId: string | undefined = undefined;
+    let vName: string | undefined = undefined;
+    let iNum: string | undefined = undefined;
+
+    if (Array.isArray(clientAudits) && clientAudits.length > 0) {
+      const found = clientAudits.find(a => 
+        (hash && a.fileHash && String(a.fileHash).toLowerCase().trim() === hash) ||
+        (inv && (
+          (a.invoiceNumber && String(a.invoiceNumber).toLowerCase().trim() === inv) ||
+          (a.poNumber && String(a.poNumber).toLowerCase().trim() === inv)
+        ))
+      );
+      if (found) {
+        rId = found.id;
+        vName = found.vendorName || found.title;
+        iNum = found.invoiceNumber || found.poNumber;
+      }
+    }
+
+    if (!rId) {
+      const recs = processedReplayLedger.get(cleanUserId);
+      if (recs) {
+        const foundRec = recs.find(r =>
+          (hash && r.fileHash && r.fileHash === hash) ||
+          (inv && r.invoiceNumber && r.invoiceNumber === inv)
+        );
+        if (foundRec) {
+          rId = foundRec.auditId;
+          vName = vName || foundRec.vendorName;
+          iNum = iNum || foundRec.invoiceNumber;
+        }
+      }
+    }
+
+    if (!rId && hash) {
+      for (const [sKey, sRec] of serverAuditStore.entries()) {
+        if (sRec?.fileHash && String(sRec.fileHash).toLowerCase().trim() === hash) {
+          rId = sRec.id || sKey;
+          vName = vName || sRec.vendorName || sRec.title;
+          iNum = iNum || sRec.invoiceNumber || sRec.poNumber;
+          break;
+        }
+      }
+    }
+
+    return {
+      matchedRecordId: rId || (currentAuditId ? `audit_${currentAuditId.slice(-6)}` : undefined),
+      vendorName: vName || 'Audited Vault Vendor',
+      invoiceNumber: iNum || inv || (hash ? `INV-${hash.slice(0, 8).toUpperCase()}` : undefined)
+    };
+  };
+
   try {
     const cleanHash = fileHash ? fileHash.toLowerCase().trim() : null;
     const cleanInv = invoiceNumber ? invoiceNumber.toLowerCase().trim() : null;
@@ -782,6 +930,7 @@ function checkDuplicateReplay(
     // 1. Client Audits Check (Exact Vault Record Resolution)
     if (Array.isArray(clientAudits) && clientAudits.length > 0) {
       for (const aud of clientAudits) {
+        if (currentAuditId && aud.id === currentAuditId) continue;
         const audHash = aud.fileHash ? String(aud.fileHash).toLowerCase().trim() : null;
         const audInv = (aud.invoiceNumber || aud.poNumber) ? String(aud.invoiceNumber || aud.poNumber).toLowerCase().trim() : null;
         
@@ -811,9 +960,10 @@ function checkDuplicateReplay(
     }
 
     // 2. Server In-Memory Ledger Check
-    const records = processedReplayLedger.get(userId);
+    const records = processedReplayLedger.get(cleanUserId);
     if (records && records.length > 0) {
       for (const rec of records) {
+        if (currentAuditId && rec.auditId && rec.auditId === currentAuditId) continue;
         if (cleanHash && rec.fileHash && rec.fileHash === cleanHash) {
           return {
             isDuplicate: true,
@@ -843,6 +993,7 @@ function checkDuplicateReplay(
     if (Array.isArray(activeStreamMessages) && activeStreamMessages.length > 0) {
       const priorMessages = activeStreamMessages.slice(0, -1);
       for (const m of priorMessages) {
+        if (currentAuditId && (m.auditId === currentAuditId || m.id === currentAuditId)) continue;
         if (cleanHash && m.attachment) {
           const resolved = resolveDecryptedAttachment(m.attachment);
           if (resolved && resolved.buffer) {
@@ -921,26 +1072,70 @@ function checkDuplicateReplay(
       }
     }
 
-    // 4. Immediate Active Session Set Check (sessionHashes & sessionInvoiceNumbers)
-    if (cleanHash && sessionHashes.has(cleanHash)) {
-      return { isDuplicate: true, matchedField: 'Cryptographic File Hash', matchedValue: cleanHash, fileHash: cleanHash };
+    // 4. Immediate Active Session Set Check (userSessionHashes & userSessionInvoiceNumbers)
+    const uHashes = getUserSessionHashes(cleanUserId);
+    const uInvoices = getUserSessionInvoiceNumbers(cleanUserId);
+    if (cleanHash && uHashes.has(cleanHash)) {
+      const meta = resolveMetadataFromLedger(cleanHash, null);
+      return {
+        isDuplicate: true,
+        matchedField: 'Cryptographic File Hash',
+        matchedValue: cleanHash,
+        fileHash: cleanHash,
+        matchedRecordId: meta.matchedRecordId,
+        matchedVendorName: meta.vendorName,
+        vendorName: meta.vendorName,
+        matchedInvoiceNumber: meta.invoiceNumber,
+        invoiceNumber: meta.invoiceNumber
+      };
     }
-    if (cleanInv && sessionInvoiceNumbers.has(cleanInv)) {
-      return { isDuplicate: true, matchedField: 'Invoice / PO Identifier', matchedValue: cleanInv, invoiceNumber: cleanInv };
+    if (cleanInv && uInvoices.has(cleanInv)) {
+      const meta = resolveMetadataFromLedger(null, cleanInv);
+      return {
+        isDuplicate: true,
+        matchedField: 'Invoice / PO Identifier',
+        matchedValue: cleanInv,
+        invoiceNumber: cleanInv,
+        matchedRecordId: meta.matchedRecordId,
+        matchedVendorName: meta.vendorName,
+        vendorName: meta.vendorName,
+        matchedInvoiceNumber: cleanInv
+      };
     }
 
     // 5. Persistent Cloud Firestore Collection Check
     if (Array.isArray(clientExistingHashes) && cleanHash) {
       const found = clientExistingHashes.some(h => String(h).toLowerCase().trim() === cleanHash);
       if (found) {
-        return { isDuplicate: true, matchedField: 'Cryptographic File Hash', matchedValue: cleanHash, fileHash: cleanHash };
+        const meta = resolveMetadataFromLedger(cleanHash, null);
+        return {
+          isDuplicate: true,
+          matchedField: 'Cryptographic File Hash',
+          matchedValue: cleanHash,
+          fileHash: cleanHash,
+          matchedRecordId: meta.matchedRecordId,
+          matchedVendorName: meta.vendorName,
+          vendorName: meta.vendorName,
+          matchedInvoiceNumber: meta.invoiceNumber,
+          invoiceNumber: meta.invoiceNumber
+        };
       }
     }
 
     if (Array.isArray(clientExistingInvoiceNumbers) && cleanInv) {
       const found = clientExistingInvoiceNumbers.some(inv => String(inv).toLowerCase().trim() === cleanInv);
       if (found) {
-        return { isDuplicate: true, matchedField: 'Invoice / PO Identifier', matchedValue: cleanInv, invoiceNumber: cleanInv };
+        const meta = resolveMetadataFromLedger(null, cleanInv);
+        return {
+          isDuplicate: true,
+          matchedField: 'Invoice / PO Identifier',
+          matchedValue: cleanInv,
+          invoiceNumber: cleanInv,
+          matchedRecordId: meta.matchedRecordId,
+          matchedVendorName: meta.vendorName,
+          vendorName: meta.vendorName,
+          matchedInvoiceNumber: cleanInv
+        };
       }
     }
 
@@ -949,11 +1144,34 @@ function checkDuplicateReplay(
     console.warn(`[Replay Protection Warning] Fallback to safe in-memory session check for user ${userId}:`, err?.message || err);
     const cleanHash = fileHash ? fileHash.toLowerCase().trim() : null;
     const cleanInv = invoiceNumber ? invoiceNumber.toLowerCase().trim() : null;
-    if (cleanHash && sessionHashes.has(cleanHash)) {
-      return { isDuplicate: true, matchedField: 'Cryptographic File Hash', matchedValue: cleanHash, fileHash: cleanHash };
+    const uHashes = getUserSessionHashes(cleanUserId);
+    const uInvoices = getUserSessionInvoiceNumbers(cleanUserId);
+    if (cleanHash && uHashes.has(cleanHash)) {
+      const meta = resolveMetadataFromLedger(cleanHash, null);
+      return {
+        isDuplicate: true,
+        matchedField: 'Cryptographic File Hash',
+        matchedValue: cleanHash,
+        fileHash: cleanHash,
+        matchedRecordId: meta.matchedRecordId,
+        matchedVendorName: meta.vendorName,
+        vendorName: meta.vendorName,
+        matchedInvoiceNumber: meta.invoiceNumber,
+        invoiceNumber: meta.invoiceNumber
+      };
     }
-    if (cleanInv && sessionInvoiceNumbers.has(cleanInv)) {
-      return { isDuplicate: true, matchedField: 'Invoice / PO Identifier', matchedValue: cleanInv, invoiceNumber: cleanInv };
+    if (cleanInv && uInvoices.has(cleanInv)) {
+      const meta = resolveMetadataFromLedger(null, cleanInv);
+      return {
+        isDuplicate: true,
+        matchedField: 'Invoice / PO Identifier',
+        matchedValue: cleanInv,
+        invoiceNumber: cleanInv,
+        matchedRecordId: meta.matchedRecordId,
+        matchedVendorName: meta.vendorName,
+        vendorName: meta.vendorName,
+        matchedInvoiceNumber: cleanInv
+      };
     }
     return { isDuplicate: false };
   }
@@ -983,7 +1201,7 @@ export function detectSecurityViolation(text: string): { isViolation: boolean; t
 
   for (const pattern of injectionPatterns) {
     if (pattern.test(lower)) {
-      return { isViolation: true, threatVector: 'ADVERSARIAL_PROMPT_INJECTION' };
+      return { isViolation: true, threatVector: 'Prompt Override Attempt' };
     }
   }
 
@@ -1004,10 +1222,12 @@ function getGenAI(): GoogleGenAI {
 }
 
 // Resilient Model Fallback Ladder with dynamically tracked cooldowns
-// Directive 4: 1. gemini-3.1-flash-lite, 2. gemini-flash-latest, 3. gemini-3.6-flash, 4. gemini-3.7-flash, plus gemini-3.8-flash tier
+// Directive 4: Dynamic chain including gemini-3.1-flash-lite, gemini-flash-latest, gemini-2.5-flash, gemini-1.5-flash, gemini-3.6-flash, gemini-3.7-flash, and gemini-3.8-flash
 const ALL_MODELS = [
   'gemini-3.1-flash-lite',
   'gemini-flash-latest',
+  'gemini-2.5-flash',
+  'gemini-1.5-flash',
   'gemini-3.6-flash',
   'gemini-3.7-flash',
   'gemini-3.8-flash',
@@ -1042,8 +1262,15 @@ function markModelRateLimited(modelName: string, retryDelaySeconds: number = 60)
 
 // Helper to check if model supports thinkingConfig (Directive 3 & 4)
 function modelSupportsThinkingBudget(modelName: string): boolean {
-  // gemini-3.6-flash does not accept thinkingConfig: { thinkingBudget }
-  if (modelName === 'gemini-3.6-flash') return false;
+  // Models that do NOT support thinkingConfig: { thinkingBudget }
+  if (
+    modelName === 'gemini-3.6-flash' ||
+    modelName === 'gemini-1.5-flash' ||
+    modelName === 'gemini-2.5-flash' ||
+    modelName === 'gemini-flash-latest'
+  ) {
+    return false;
+  }
   return true;
 }
 
@@ -1480,17 +1707,23 @@ function isRateLimitError(err: any): boolean {
   return (
     status === 429 ||
     status === 503 ||
+    status === 422 ||
     status === 'UNAVAILABLE' ||
+    status === 'RESOURCE_EXHAUSTED' ||
     msg.includes('429') ||
     msg.includes('503') ||
     msg.includes('unavailable') ||
     msg.includes('high demand') ||
     msg.includes('spikes in demand') ||
     msg.includes('resource_exhausted') ||
+    msg.includes('resourceexhausted') ||
     msg.includes('quota') ||
+    msg.includes('quota limits exceeded') ||
     msg.includes('rate limit') ||
     msg.includes('rate_limit') ||
-    msg.includes('too many requests')
+    msg.includes('too many requests') ||
+    msg.includes('billing') ||
+    msg.includes('exceeded your current quota')
   );
 }
 
@@ -2347,14 +2580,29 @@ app.post(['/api/audit/verify', '/api/audit/reconcile-file'], async (req, res) =>
 
       // Vision / OCR Fallback: If local parser didn't extract subtotal or total, attempt OCR and Gemini Vision
       if ((!localInvoice || (localInvoice.subtotal === undefined && localInvoice.statedTotal === undefined)) && attachment) {
+        let visionRateLimited = false;
         const ocrRes = await ocr_extraction(attachment, textToAudit);
         if (ocrRes.invoiceData && (ocrRes.invoiceData.subtotal !== undefined || ocrRes.invoiceData.statedTotal !== undefined)) {
           localInvoice = ocrRes.invoiceData;
         } else if (ocrRes.normalizedImage && process.env.GEMINI_API_KEY) {
-          const visionExtracted = await extractInvoiceViaGeminiVision(ocrRes.normalizedImage, textToAudit);
-          if (visionExtracted && (visionExtracted.subtotal !== undefined || visionExtracted.statedTotal !== undefined)) {
-            localInvoice = visionExtracted;
+          try {
+            const visionExtracted = await extractInvoiceViaGeminiVision(ocrRes.normalizedImage, textToAudit);
+            if (visionExtracted && (visionExtracted.subtotal !== undefined || visionExtracted.statedTotal !== undefined)) {
+              localInvoice = visionExtracted;
+            }
+          } catch (vErr: any) {
+            if (isRateLimitError(vErr)) {
+              visionRateLimited = true;
+            }
           }
+        }
+
+        if ((!localInvoice || (localInvoice.subtotal === undefined && localInvoice.statedTotal === undefined)) && visionRateLimited) {
+          return res.status(429).json({
+            success: false,
+            errorType: 'QUOTA_EXCEEDED',
+            message: 'AI Studio API quota limit reached. Please wait a moment or check project billing limits.'
+          });
         }
       }
 
@@ -2387,6 +2635,13 @@ app.post(['/api/audit/verify', '/api/audit/reconcile-file'], async (req, res) =>
     });
   } catch (error: any) {
     console.error('Audit processing error:', error);
+    if (isRateLimitError(error)) {
+      return res.status(429).json({
+        success: false,
+        errorType: 'QUOTA_EXCEEDED',
+        message: 'AI Studio API quota limit reached. Please wait a moment or check project billing limits.'
+      });
+    }
     return res.status(500).json({ error: error?.message || 'Audit processing error' });
   }
 });
@@ -2445,10 +2700,10 @@ app.post('/api/gemini/audit-journal', async (req, res) => {
 
     if (violationCheck.isViolation) {
       console.warn(`[SECURITY VIOLATION DETECTED] Prompt injection / security override attempt by user ${userId}:`, latestUserText);
+      const threatTitle = violationCheck.threatVector || 'Prompt Override Attempt';
       return res.json({
         reply: `### 🛡️ FORENSIC AUDIT ALERT & TRANSACTION REJECTION\n\n` +
-          `**AUDIT STATUS**: \`SECURITY VIOLATION DETECTED / AUDIT FAILURE\`\n` +
-          `**THREAT VECTOR**: \`${violationCheck.threatVector || 'ADVERSARIAL_PROMPT_INJECTION'}\`\n\n` +
+          `**AUDIT STATUS**: \`SECURITY VIOLATION DETECTED / AUDIT FAILURE\` &nbsp;&nbsp;&nbsp;&nbsp; **THREAT VECTOR**: \`${threatTitle}\`\n\n` +
           `**Audit Findings**:\n` +
           `An explicit override attempt was detected and blocked. The system intercepted adversarial instructions attempting to bypass security constraints or authorize direct unauthorized expenses without multi-layer cryptographic and mathematical verification. Direct unauthorized expense authorization is rejected.\n\n` +
           `**Strategic Recommendation & Ledger Status**:\n` +
@@ -2458,7 +2713,8 @@ app.post('/api/gemini/audit-journal', async (req, res) => {
         status: 'FLAGGED',
         auditStatus: 'FLAGGED',
         fraudRiskScore: 'CRITICAL',
-        fraudReason: 'Adversarial Prompt Injection & Security Constitution Override Attempt',
+        fraudReason: 'Adversarial Prompt Override & Security Policy Violation Attempt',
+        threatVector: threatTitle,
         totalMismatch: false,
         taxMismatch: false,
         lineItemMismatch: false,
@@ -2471,14 +2727,15 @@ app.post('/api/gemini/audit-journal', async (req, res) => {
         toolCalls: [{
           toolName: 'security_violation_handler',
           params: {
-            threatVector: violationCheck.threatVector || 'ADVERSARIAL_PROMPT_INJECTION',
+            threatVector: threatTitle,
             rawPrompt: latestUserText
           },
           result: {
             isFraudulent: true,
             status: 'FLAGGED',
-            threatVector: violationCheck.threatVector || 'ADVERSARIAL_PROMPT_INJECTION',
-            action: 'TRANSACTION_REJECTED',
+            threatVector: threatTitle,
+            action: 'Unauthorized Expense Blocked',
+            enforcement: 'Unauthorized Expense Blocked',
             reason: 'Attempted to bypass security constitution and authorize bogus expense without verification.'
           }
         }]
@@ -2513,15 +2770,15 @@ app.post('/api/gemini/audit-journal', async (req, res) => {
         });
 
         // Immediately reject replay attempt cleanly with 200 and structured fraud response
-        const resolvedInvoiceNo = replayCheck.invoiceNumber || invoiceNumber || 'IDENTIFIER-LOCKED';
-        const resolvedVendor = replayCheck.vendorName || 'Previous Audit Vendor';
+        const resolvedInvoiceNo = replayCheck.matchedInvoiceNumber || replayCheck.invoiceNumber || invoiceNumber || (fileHash ? `INV-${fileHash.slice(0, 8).toUpperCase()}` : 'Audited Invoice');
+        const resolvedVendor = replayCheck.matchedVendorName || replayCheck.vendorName || 'Audited Vault Vendor';
 
         return res.json({
           isDuplicate: true,
           isFraudulent: true,
           status: 'FLAGGED',
-          fraudReason: 'Duplicate Replay Attack: This exact invoice file or invoice number has already been processed.',
-          reply: `⚠️ **CRITICAL FRAUD REJECTION**: Duplicate Replay Attack detected. This exact invoice (${resolvedInvoiceNo}) has already been processed in your vault ledger.`,
+          fraudReason: `Duplicate Replay Intercept: This exact invoice document (${resolvedInvoiceNo}) has already been audited and sealed in your sovereign ledger.`,
+          reply: `⚠️ **DUPLICATE RECORD INTERCEPT**: Duplicate submission detected. This exact invoice (${resolvedInvoiceNo} from ${resolvedVendor}) has already been processed and sealed in your vault ledger. Re-audit halted to prevent duplicate disbursement.`,
           auditStatus: 'FLAGGED',
           fraudRiskScore: 'CRITICAL',
           totalMismatch: false,
@@ -2548,7 +2805,7 @@ app.post('/api/gemini/audit-journal', async (req, res) => {
               status: 'FLAGGED',
               isDuplicate: true,
               fraudRiskScore: 'CRITICAL',
-              reason: 'Duplicate Replay Attack: This exact invoice file or invoice number has already been processed.',
+              reason: `Duplicate Replay Intercept: This exact invoice file (${resolvedInvoiceNo}) has already been audited and registered in your ledger.`,
               matchedField: replayCheck.matchedField,
               matchedRecordId: replayCheck.matchedRecordId,
               matchedSessionId: replayCheck.matchedSessionId,
@@ -2647,10 +2904,132 @@ app.post('/api/gemini/audit-journal', async (req, res) => {
     }
 
     // Step 1: Initial invocation with Function Calling enabled
-    const initialResult = await runGeminiWithFallback(messages, {
-      enableTools: true,
-      temperature: 0.2
-    });
+    let initialResult: any = null;
+    let initialError: any = null;
+    try {
+      initialResult = await runGeminiWithFallback(messages, {
+        enableTools: true,
+        temperature: 0.2
+      });
+    } catch (llmErr: any) {
+      console.warn('[runGeminiWithFallback Error, triggering deterministic local fallback]:', llmErr?.message || llmErr);
+      initialError = llmErr;
+    }
+
+    // Deterministic Local Fallback Engine if all external models fail or are rate-limited
+    if (!initialResult || !initialResult.response) {
+      const latestMessage = messages[messages.length - 1];
+      const latestText = (latestMessage?.content || latestMessage?.text || '') as string;
+      const latestAttachment = latestMessage?.attachment;
+      let localInvoice = await extractLocalInvoiceData(latestText, latestAttachment);
+
+      if ((!localInvoice || (localInvoice.subtotal === undefined && localInvoice.statedTotal === undefined)) && latestAttachment) {
+        try {
+          const ocrRes = await ocr_extraction(latestAttachment, latestText);
+          if (ocrRes.invoiceData && (ocrRes.invoiceData.subtotal !== undefined || ocrRes.invoiceData.statedTotal !== undefined || (Array.isArray(ocrRes.invoiceData.lineItems) && ocrRes.invoiceData.lineItems.length > 0))) {
+            localInvoice = ocrRes.invoiceData;
+          }
+        } catch (ocrErr: any) {
+          console.warn('[Local OCR Fallback Notice in Chat Turn]:', ocrErr?.message || ocrErr);
+        }
+      }
+
+      if (localInvoice && (localInvoice.subtotal !== undefined || localInvoice.statedTotal !== undefined || (Array.isArray(localInvoice.lineItems) && localInvoice.lineItems.length > 0))) {
+        const mathResult = executeReconcileMath({
+          ...localInvoice,
+          vendorName: localInvoice.vendorName,
+          taxId: localInvoice.taxId,
+          poNumber: localInvoice.poNumber,
+          invoiceNumber: localInvoice.poNumber || (localInvoice as any).invoiceNumber,
+          subtotal: Number(localInvoice.subtotal || 0),
+          taxRate: localInvoice.taxRate !== undefined ? Number(localInvoice.taxRate) : undefined,
+          statedTax: localInvoice.statedTax !== undefined ? Number(localInvoice.statedTax) : undefined,
+          statedTotal: Number(localInvoice.statedTotal || 0),
+          lineItems: localInvoice.lineItems,
+          itemSummary: localInvoice.itemSummary || 'Financial Item'
+        });
+
+        if (localInvoice.poNumber || fileHash) {
+          recordProcessedAudit(
+            userId,
+            payload.auditId,
+            fileHash,
+            localInvoice.poNumber ? String(localInvoice.poNumber).trim() : null
+          );
+        }
+
+        const lines: string[] = ['### Forensic Multi-Layer Audit Telemetry Report (Deterministic Local Fallback Engine)\n'];
+        lines.push(`**Transaction Item**: ${mathResult.itemSummary || 'Financial Item'}`);
+        if (mathResult.vendorName || mathResult.taxId || mathResult.poNumber) {
+          lines.push(`- **Entity Metadata**: Vendor: ${mathResult.vendorName || 'N/A'} | Tax ID: ${mathResult.taxId || 'N/A'} | PO: ${mathResult.poNumber || 'N/A'}`);
+        }
+        lines.push(`- **Layer 1 (Macro Math)**: Subtotal $${safeToFixed(mathResult.subtotal)} + ${mathResult.taxRate ?? 0}% Tax ($${safeToFixed(mathResult.calculatedTax)}) = Forensic Total $${safeToFixed(mathResult.calculatedTotal)} (Stated: $${safeToFixed(mathResult.statedTotal)}, Variance: $${safeToFixed(mathResult.discrepancy)}) [${mathResult.checks?.macroMath ? 'PASS' : 'FAIL'}]`);
+        lines.push(`- **Layer 2 (Micro Math)**: Itemized Line-Item Validation [${mathResult.checks?.microMath ? 'PASS' : 'FAIL'}]`);
+        if (mathResult.lineItemMismatch) {
+          lines.push(`  ⚠️ *Line Item Discrepancy*: Sum of itemized lines does not match calculated subtotal.`);
+        }
+        lines.push(`- **Layer 3 (Metadata & Integrity)**: Entity & PO Validation [${mathResult.checks?.metadataFormat ? 'PASS' : 'FAIL'}]`);
+        lines.push(`\n**Audit Verdict**: ${mathResult.status}`);
+        if (mathResult.isFraudulent) {
+          lines.push(`⚠️ **DISCREPANCY DETECTED**: ${mathResult.fraudReason || 'Mathematical or metadata discrepancies flagged.'}`);
+        } else {
+          lines.push(`✅ **VERIFIED**: Mathematical reconciliation validated clean across all 3 audit layers.`);
+        }
+
+        return res.json({
+          reply: lines.join('\n'),
+          toolCalls: [{
+            toolName: 'reconcile_invoice_math',
+            params: localInvoice,
+            result: mathResult
+          }],
+          isFraudulent: mathResult.isFraudulent,
+          status: mathResult.isFraudulent ? 'FLAGGED' : 'VERIFIED',
+          auditStatus: mathResult.isFraudulent ? 'FLAGGED' : 'VERIFIED',
+          fraudRiskScore: mathResult.fraudRiskScore,
+          fraudReason: mathResult.fraudReason,
+          totalMismatch: mathResult.totalMismatch,
+          taxMismatch: mathResult.taxMismatch,
+          lineItemMismatch: mathResult.lineItemMismatch,
+          isDuplicate: mathResult.isDuplicate,
+          modelUsed: 'local-deterministic-engine'
+        });
+      }
+
+      // Check if the underlying failure was an API quota exhaustion
+      if (initialError && isRateLimitError(initialError)) {
+        return res.status(429).json({
+          success: false,
+          errorType: 'QUOTA_EXCEEDED',
+          message: 'AI Studio API quota limit reached. Please wait a moment or check project billing limits.'
+        });
+      }
+
+      if (latestAttachment) {
+        return res.status(422).json({
+          success: false,
+          reply: '⚠️ **Forensic Audit Error: Unable to read image text / OCR failed**\n\nThe uploaded invoice file could not be processed for readable text or numerical values. Please ensure the document is clear, legible, and uncorrupted.',
+          error: 'Unable to read image text / OCR failed',
+          ocrFailed: true,
+          status: 'FLAGGED',
+          auditStatus: 'FLAGGED',
+          isFraudulent: false,
+          fraudReason: 'Unable to read image text / OCR failed: Failed to extract readable text or financial data from uploaded file.',
+          fraudRiskScore: 'HIGH',
+          modelUsed: 'local-deterministic-engine'
+        });
+      }
+
+      return res.json({
+        reply: `Forensic audit log recorded (offline deterministic mode). Note: ${initialError?.message || 'External model fallback triggered'}.`,
+        toolCalls: [],
+        isFraudulent: false,
+        status: 'VERIFIED',
+        auditStatus: 'LOGGED',
+        fraudRiskScore: 'LOW',
+        modelUsed: 'local-deterministic-engine'
+      });
+    }
 
     const candidate = initialResult.response.candidates?.[0];
     const functionCalls = candidate?.content?.parts?.filter(
@@ -2686,12 +3065,16 @@ app.post('/api/gemini/audit-journal', async (req, res) => {
               });
 
               // Halt further LLM execution, skip reconcile_invoice_math, return clean 200 payload
+              const resolvedPostInv = postOcrReplay.matchedInvoiceNumber || String(extractedInv).trim();
+              const resolvedPostVendor = postOcrReplay.matchedVendorName || (extractedArgs.vendorName ? String(extractedArgs.vendorName) : 'Audited Vault Vendor');
+
               return res.json({
                 isDuplicate: true,
                 isFraudulent: true,
-                fraudReason: `Duplicate Replay Attack: Extracted ${postOcrReplay.matchedField === 'fileHash' ? 'file hash' : 'invoice number'} (${extractedInv}) has already been recorded in your vault.`,
-                reply: `⚠️ **CRITICAL FRAUD REJECTION**: Duplicate Replay Attack detected. Extracted invoice reference **${extractedInv}** already exists in your vault ledger. Further execution halted to prevent duplicate billing.`,
-                auditStatus: 'DISCREPANCY_FLAGGED',
+                status: 'FLAGGED',
+                fraudReason: `Duplicate Replay Intercept: Extracted invoice reference (${resolvedPostInv}) has already been audited and sealed in your sovereign ledger.`,
+                reply: `⚠️ **DUPLICATE RECORD INTERCEPT**: Duplicate submission detected. Extracted invoice reference **${resolvedPostInv}** already exists in your vault ledger. Further execution halted to prevent duplicate disbursement.`,
+                auditStatus: 'FLAGGED',
                 fraudRiskScore: 'CRITICAL',
                 checks: {
                   macroMath: false,
@@ -2703,18 +3086,21 @@ app.post('/api/gemini/audit-journal', async (req, res) => {
                   toolName: 'replay_protection_filter',
                   params: {
                     fileHash: fileHash || undefined,
-                    invoiceNumber: String(extractedInv).trim(),
+                    invoiceNumber: resolvedPostInv,
                     matchedField: postOcrReplay.matchedField,
-                    vendorName: extractedArgs.vendorName ? String(extractedArgs.vendorName) : undefined
+                    matchedRecordId: postOcrReplay.matchedRecordId,
+                    vendorName: resolvedPostVendor
                   },
                   result: {
                     isFraudulent: true,
-                    status: 'DISCREPANCY_FLAGGED',
+                    status: 'FLAGGED',
                     fraudRiskScore: 'CRITICAL',
-                    reason: `Duplicate Replay Attack: This exact invoice (${extractedInv}) is already registered in your vault.`,
+                    reason: `Duplicate Replay Intercept: This exact invoice (${resolvedPostInv}) is already registered in your vault.`,
                     matchedField: postOcrReplay.matchedField,
-                    poNumber: String(extractedInv).trim(),
-                    vendorName: extractedArgs.vendorName ? String(extractedArgs.vendorName) : undefined,
+                    matchedRecordId: postOcrReplay.matchedRecordId,
+                    poNumber: resolvedPostInv,
+                    invoiceNumber: resolvedPostInv,
+                    vendorName: resolvedPostVendor,
                     checks: {
                       macroMath: false,
                       microMath: false,
@@ -2723,8 +3109,10 @@ app.post('/api/gemini/audit-journal', async (req, res) => {
                     }
                   }
                 }],
+                matchedRecordId: postOcrReplay.matchedRecordId,
+                vendorName: resolvedPostVendor,
                 fileHash: fileHash || undefined,
-                invoiceNumber: String(extractedInv).trim(),
+                invoiceNumber: resolvedPostInv,
                 matchedField: postOcrReplay.matchedField
               });
             }
@@ -3550,8 +3938,8 @@ app.delete(['/api/vault/records/:recordId', '/api/audits/:recordId', '/api/audit
     const userIdHeader = req.headers['x-user-id'] || req.headers['authorization'];
     const userId = typeof userIdHeader === 'string' ? userIdHeader.replace(/^Bearer\s+/i, '').trim() : '';
     const body = req.body && typeof req.body === 'object' ? req.body : {};
-    const fileHash = body.fileHash || (req.query.fileHash as string) || undefined;
-    const invoiceNumber = body.invoiceNumber || (req.query.invoiceNumber as string) || undefined;
+    let fileHash = body.fileHash || (req.query.fileHash as string) || undefined;
+    let invoiceNumber = body.invoiceNumber || (req.query.invoiceNumber as string) || undefined;
 
     if (!recordId || typeof recordId !== 'string') {
       return res.status(400).json({ 
@@ -3569,6 +3957,15 @@ app.delete(['/api/vault/records/:recordId', '/api/audits/:recordId', '/api/audit
         error: 'Unauthorized: User authorization context is required to delete ledger entries.',
         success: false
       });
+    }
+
+    // Recover fileHash and invoiceNumber from serverAuditStore if not passed in delete request
+    const existingCached = serverAuditStore.get(`${cleanUserId}:${cleanRecordId}`) || serverAuditStore.get(cleanRecordId);
+    if (existingCached) {
+      if (!fileHash && existingCached.fileHash) fileHash = existingCached.fileHash;
+      if (!invoiceNumber && (existingCached.invoiceNumber || existingCached.poNumber)) {
+        invoiceNumber = existingCached.invoiceNumber || existingCached.poNumber;
+      }
     }
 
     // Purge associated fileHash / invoiceNumber and recordId from server-side active session replay cache

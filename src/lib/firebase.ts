@@ -13,6 +13,8 @@ import {
   doc, 
   getDocs, 
   getDoc, 
+  deleteDoc,
+  setDoc,
   query, 
   orderBy,
   setLogLevel
@@ -367,7 +369,16 @@ export async function deleteUserAudit(userId: string, auditId: string, fileHash?
     }
   } catch {}
 
-  // Ensure Firestore deletions are performed EXCLUSIVELY by server.ts using the Firebase Admin SDK
+  // Direct client Firestore deleteDoc for owner-isolated path for immediate consistency
+  if (auth.currentUser && auth.currentUser.uid === userId && db) {
+    try {
+      await deleteDoc(doc(db, 'users', userId, 'audits', auditId));
+    } catch (clientDocErr) {
+      console.warn('[Firestore client deleteDoc notice]:', clientDocErr);
+    }
+  }
+
+  // Ensure Firestore deletions & in-memory replay ledger purges are performed by server
   const res = await fetch(`/api/vault/records/${encodeURIComponent(auditId)}`, {
     method: 'DELETE',
     headers: {
