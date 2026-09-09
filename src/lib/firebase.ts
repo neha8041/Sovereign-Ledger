@@ -306,7 +306,7 @@ export async function saveUserAudit(userId: string, audit: AuditVaultEntry): Pro
   // Ensure Firestore writes are performed EXCLUSIVELY by server.ts using the Firebase Admin SDK.
   // Sensitive financial fields (itemSummary, lineItems, extractedData, explanation) are encrypted
   // into encryptedPayload and raw plain-text fields are purged on the server prior to persistence.
-  const res = await fetch('/api/audit', {
+  const res = await fetch('/api/vault/save', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',

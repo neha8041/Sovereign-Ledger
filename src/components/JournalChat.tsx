@@ -21,7 +21,7 @@ import {
   ShieldX
 } from 'lucide-react';
 import type { ChatMessage, MessageAttachment, AuditVaultEntry } from '../types';
-import { safeToFixed } from '../lib/sanitizer';
+import { safeToFixed, cleanVendorName } from '../lib/sanitizer';
 
 const formatThreatVector = (raw?: string): string => {
   if (!raw) return 'Prompt Override Attempt';
@@ -90,23 +90,25 @@ export const JournalChat: React.FC<JournalChatProps> = ({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if ((!inputText.trim() && !pendingAttachment) || isProcessing) return;
-    
-    let defaultPrompt = 'Please review and audit the attached document.';
-    if (pendingAttachment) {
-      if (pendingAttachment.mimeType === 'application/pdf') {
-        defaultPrompt = 'Please perform a forensic financial audit on the attached PDF invoice, extract line items, vendor name, tax ID, PO number, subtotal, tax rate, and verify the math.';
-      } else if (pendingAttachment.mimeType.startsWith('image/')) {
-        defaultPrompt = 'Please perform an Optical Character Recognition (OCR) forensic audit on this invoice image (PNG/JPEG/WEBP). Extract all itemized line items, vendor name, tax ID, PO number, subtotal, tax rate, stated total, and execute reconcile_invoice_math.';
-      }
-    }
+    if (isProcessing) return;
 
-    const textToSend = inputText.trim() ? inputText.trim() : defaultPrompt;
-    const attachmentToSend = pendingAttachment || undefined;
+    const DEFAULT_AUDIT_PROMPT = "Perform a complete 3-layer forensic audit and mathematical reconciliation on the attached document.";
 
+    const selectedFile = pendingAttachment;
+    const prompt = inputText;
+
+    const finalPrompt = prompt.trim() !== "" 
+      ? prompt.trim() 
+      : (selectedFile ? DEFAULT_AUDIT_PROMPT : "");
+
+    if (!finalPrompt && !selectedFile) return;
+
+    // Reset local UI input states synchronously
     setInputText('');
     setPendingAttachment(null);
-    await onSendMessage(textToSend, attachmentToSend);
+
+    // Pass finalPrompt directly into the API request payload
+    await onSendMessage(finalPrompt, selectedFile || undefined);
   };
 
   // Format file size nicely
@@ -415,17 +417,18 @@ export const JournalChat: React.FC<JournalChatProps> = ({
                       // If this is a duplicate replay protection block, render high-contrast alert card with vault link
                       if (isReplayBlock) {
                         const matchedRecordId = tc.params?.matchedRecordId || res.matchedRecordId || tc.params?.matchedSessionId || res.matchedSessionId;
-                        const displayVendor = tc.params?.vendorName || res.vendorName || '';
-                        const rawInvoiceNo = tc.params?.invoiceNumber || res.poNumber || res.invoiceNumber || '';
-                        const displayInvoiceNumber = rawInvoiceNo && !rawInvoiceNo.includes('sessionMessage') && !rawInvoiceNo.includes('{') ? rawInvoiceNo : '';
+                        let displayVendor = cleanVendorName(tc.params?.matchedVendorName || res.matchedVendorName || tc.params?.vendorName || res.vendorName);
+                        const rawInvoiceNo = tc.params?.matchedInvoiceNumber || res.matchedInvoiceNumber || tc.params?.invoiceNumber || res.poNumber || res.invoiceNumber || '';
+                        let displayInvoiceNumber = rawInvoiceNo && !rawInvoiceNo.includes('sessionMessage') && !rawInvoiceNo.includes('{') ? rawInvoiceNo : '';
                         const displayHash = tc.params?.fileHash || res.fileHash || '';
                         
                         const rawMatchedField = tc.params?.matchedField || res.matchedField || '';
-                        const humanMatchedField = rawMatchedField === 'fileHash' ? 'Document Fingerprint (Duplicate File)'
-                          : rawMatchedField === 'invoiceNumber' ? 'Invoice / PO Number'
-                          : rawMatchedField === 'activeSessionHash' ? 'Active Session Document'
-                          : rawMatchedField === 'activeSessionInvoice' ? 'Active Session Ledger'
-                          : (rawMatchedField.startsWith('sessionMessage') ? 'Session Ledger Reference' : rawMatchedField);
+                        const lowerField = (rawMatchedField || '').toLowerCase();
+                        const humanMatchedField = (lowerField === 'filehash' || lowerField === 'cryptographic file hash' || lowerField.includes('hash') || lowerField.includes('duplicate document file'))
+                          ? 'Duplicate Document File'
+                          : (lowerField === 'invoicenumber' || lowerField.includes('invoice') || lowerField.includes('identifier') || lowerField.includes('existing ledger record'))
+                          ? 'Existing Ledger Record'
+                          : (rawMatchedField.startsWith('sessionMessage') ? 'Session Ledger Reference' : (rawMatchedField || 'Duplicate Document File'));
 
                         const matchedAudit = audits.find(a => {
                           if (matchedRecordId && a.id === matchedRecordId) return true;
@@ -434,6 +437,19 @@ export const JournalChat: React.FC<JournalChatProps> = ({
                           if (displayInvoiceNumber && a.poNumber && a.poNumber.toLowerCase().trim() === displayInvoiceNumber.toLowerCase().trim()) return true;
                           return false;
                         });
+
+                        if (matchedAudit) {
+                          if (!displayVendor) {
+                            displayVendor = cleanVendorName(matchedAudit.vendorName) || 
+                              (Array.isArray(matchedAudit.financialReconciliations) && matchedAudit.financialReconciliations.length > 0 
+                                ? cleanVendorName(matchedAudit.financialReconciliations[0]?.vendorName) 
+                                : undefined) ||
+                              cleanVendorName(matchedAudit.title);
+                          }
+                          if ((!displayInvoiceNumber || displayInvoiceNumber.startsWith('INV-')) && (matchedAudit.invoiceNumber || matchedAudit.poNumber)) {
+                            displayInvoiceNumber = matchedAudit.invoiceNumber || matchedAudit.poNumber || displayInvoiceNumber;
+                          }
+                        }
 
                         const targetRecordForNavigation = matchedAudit || (matchedRecordId ? {
                           id: matchedRecordId,
@@ -603,11 +619,11 @@ export const JournalChat: React.FC<JournalChatProps> = ({
                           )}
 
                           {/* Metadata pill row if present */}
-                          {(res.vendorName || res.taxId || res.poNumber) && (
+                          {(cleanVendorName(res.vendorName) || res.taxId || res.poNumber) && (
                             <div className="flex flex-wrap gap-2 text-[10px] text-zinc-400">
-                              {res.vendorName && (
+                              {cleanVendorName(res.vendorName) && (
                                 <span className="px-2 py-0.5 rounded bg-zinc-900 border border-zinc-800 text-zinc-300">
-                                  Vendor: <strong className="text-zinc-200">{res.vendorName}</strong>
+                                  Vendor: <strong className="text-zinc-200">{cleanVendorName(res.vendorName)}</strong>
                                 </span>
                               )}
                               {res.taxId && (
